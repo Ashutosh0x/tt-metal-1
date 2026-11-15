@@ -54,10 +54,10 @@ inline constexpr uint32_t kLanePageBytes = kRequestPageBytes;
 inline constexpr uint32_t kSlotHeaderBytes = kLineBytes;
 inline constexpr uint32_t kFifoSlots = 16;
 
-// The line after a slot's header. The kernel that reads a PREFETCH slot's tensors from their source writes in
-// it how many blocks each receiver gets of each tensor, and the kernels after it read that count rather than
-// derive it: a group selector makes it depend on device memory that may change while the slot is served, so
-// only one kernel reads the selector. The host writes kTensorBlocksUnplanned into every word.
+// The line after a slot's header. The first kernel in tensor_prefetcher_kernels() writes in it how many blocks
+// each receiver gets of each tensor, and the kernels after it read that count rather than derive it: a group
+// selector makes it depend on device memory that may change while the slot is served, so only one kernel reads
+// the selector. The host writes kTensorBlocksUnplanned into every word.
 inline constexpr uint32_t kSlotPlanBytes = kLineBytes;
 inline constexpr uint32_t kMaxSlotTensors = kSlotPlanBytes / sizeof(uint32_t);
 inline constexpr uint32_t kTensorBlocksUnplanned = ~0u;
