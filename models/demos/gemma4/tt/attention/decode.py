@@ -253,8 +253,8 @@ _KV_FUSED_NOTED = set()
 
 
 def kv_fused_update_default(mesh_device) -> bool:
-    """Whether the decode K and V cache writes run as ONE ``paged_fused_update_cache`` program per layer (item 11 of
-    the gemma4_12b_qb2 port) instead of two ``paged_update_cache`` programs.
+    """Whether the decode K and V cache writes run as ONE ``paged_fused_update_cache`` program per layer
+    instead of two ``paged_update_cache`` programs.
 
     ``GEMMA4_KV_FUSED_UPDATE=1|0`` overrides. Policy when unset: on for the Blackhole mesh shapes in
     ``KV_FUSED_UPDATE_DEFAULT_SHAPES`` (those where the served A/B measured a win with the PCC gates intact: the
@@ -318,13 +318,12 @@ def _note_kv_fused(config, qkv_path, batch, reason):
 
 def _kv_grids_disjoint(tt_k, tt_v) -> bool:
     """Whether K's and V's shard grids share no core (the fused write's placement rule)."""
-    try:
-        from models.demos.gemma4.custom_ops.qkv_heads_norm_rope.op import shard_cores
+    if not (tt_k.is_sharded() and tt_v.is_sharded()):
+        return False  # an interleaved tensor has no shard grid
+    from models.demos.gemma4.custom_ops.qkv_heads_norm_rope.op import shard_cores
 
-        k_cores = {(c.x, c.y) for c in shard_cores(tt_k.memory_config().shard_spec.grid)}
-        v_cores = {(c.x, c.y) for c in shard_cores(tt_v.memory_config().shard_spec.grid)}
-    except Exception:  # noqa: BLE001 - an interleaved tensor has no shard spec
-        return False
+    k_cores = {(c.x, c.y) for c in shard_cores(tt_k.memory_config().shard_spec.grid)}
+    v_cores = {(c.x, c.y) for c in shard_cores(tt_v.memory_config().shard_spec.grid)}
     return bool(k_cores) and bool(v_cores) and not (k_cores & v_cores)
 
 
@@ -338,7 +337,7 @@ def pair_split_active(weights, page_table, kv_cache, is_kv_shared, sequential_kv
     knob on at the build) and a plain paged decode step. The speculative verify (``sequential_kv_write``), KV-shared
     layers (the MTP drafter) and a non-paged cache keep the 4-head path (logged once per reason). Only static
     arguments decide, never a device value, so warmup, trace capture and replay take the same branch."""
-    if getattr(weights, "pair", None) is None or not pair_split_enabled():
+    if weights.pair is None or not pair_split_enabled():
         return False
     reason = None
     sharded = kv_pair_shard_enabled()  # the KV is split over the pair: only the pair view can read it
@@ -1322,7 +1321,7 @@ def prefix_lse_verify_reason(prefix_lse, config, weights, kv_cache, kv_modulo, B
     )
     if reason is None and not plan.fits:
         reason = plan.describe()
-    if reason is None and plan.pair and getattr(weights, "pair", None) is None:
+    if reason is None and plan.pair and weights.pair is None:
         reason = "the record plans the pair split but the layer has no pair view (GEMMA4_SDPA_PAIR_SPLIT build)"
     if reason is None:
         block = effective_block_size(kv_cache[0], config.head_dim, 1)
@@ -1765,6 +1764,7 @@ def packed_decode_forward(
     # GEMMA4_SPEC_VERIFY_PREFIX_LSE: decided on static values only, before anything runs (the fresh part needs the K / V
     # this call computes, taken before the KV write)
     prefix_on = False
+    prefix_reason = "the call carries no prefix + fresh plan"
     if prefix_lse is not None:
         prefix_reason = prefix_lse_verify_reason(
             prefix_lse, config, weights, kv_cache, kv_modulo, B, P, tp, is_kv_shared=is_kv_shared

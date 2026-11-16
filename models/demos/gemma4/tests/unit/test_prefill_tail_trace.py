@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""GEMMA4_PREFILL_TAIL_IN_TRACE (item 4 of the gemma4_12b_qb2 port): a prefill capture that ends with the last-token
+"""GEMMA4_PREFILL_TAIL_IN_TRACE: a prefill capture that ends with the last-token
 tile, the lm_head and the softcap (TP-sharded, the host concatenating one row per chip) returns the same last-token
 logits, bit for bit, as the capture that returns the hidden states for the eager tail -- for host logits and for the
 device sampler's tokens -- and both agree with the eager prefill.

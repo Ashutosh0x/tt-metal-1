@@ -295,7 +295,7 @@ SAMPLING_TRACE_DEFAULT_SHAPES = ()
 
 
 def sampling_trace_default(mesh_device, mesh_config=None) -> bool:
-    """Whether a decode step's device sampler replays its own captured trace (item 3c of the gemma4_12b_qb2 port)
+    """Whether a decode step's device sampler replays its own captured trace
     instead of running its programs eagerly after every decode-trace replay.
 
     ``Gemma4Model._tt_disable_sampling_trace`` is the inverse. The shared generator captures a sampling trace at
@@ -348,8 +348,7 @@ def page_table_group_slots(layer_types, kv_shared_layer_map=None):
 
 
 def share_page_tables_default(mesh_device, mesh_config=None, *, bounded_sliding=False, kv_shared=False) -> bool:
-    """Whether the layers of one vLLM KV-cache group share one persistent page-table device buffer (item 5 of the
-    gemma4_12b_qb2 port): an install then costs one H2D copy per group (six on the 12B) instead of one per layer
+    """Whether the layers of one vLLM KV-cache group share one persistent page-table device buffer: an install then costs one H2D copy per group (six on the 12B) instead of one per layer
     (48), the host cost that sat at 9-16 ms of a 128-token prefill on the QB2 block (every served prefill follows
     a decode step, which forces the re-upload). The buffers are keyed on the model's group slots
     (``page_table_group_slots``), never on the host objects a call carries: the warmup broadcasts one legacy table
@@ -384,8 +383,8 @@ PREFILL_TAIL_TRACE_DEFAULT_SHAPES = ((1, 4), (1, 8))
 
 
 def prefill_tail_in_trace_default(mesh_device, mesh_config=None) -> bool:
-    """Whether a single-user prefill capture ends with the last-token tile, the lm_head and the softcap (item 4 of
-    the gemma4_12b_qb2 port) instead of returning the hidden states for an eager tail after every replay. The tile
+    """Whether a single-user prefill capture ends with the last-token tile, the lm_head and the softcap
+    instead of returning the hidden states for an eager tail after every replay. The tile
     is sliced at persistent device bounds the generator rewrites before the replay (one program per bucket), the
     logits stay TP-sharded on their chips: the host reads one row per chip and concatenates the vocabulary
     (``process_output_prefill``), the device sampler takes the shards as it does for decode. The eager tail stays
@@ -405,6 +404,38 @@ def prefill_tail_in_trace_default(mesh_device, mesh_config=None) -> bool:
         return env in ("1", "true", "yes", "on")
     shape = tuple(int(s) for s in mesh_device.shape) if hasattr(mesh_device, "shape") else ()
     return is_blackhole() and shape in PREFILL_TAIL_TRACE_DEFAULT_SHAPES
+
+
+def apply_build_profile(mesh_shape, hf_config, *, blackhole=None) -> dict:
+    """Record the build's decode fusion defaults (tt/mesh_orientation.py, every GEMMA4_* flag still an override) and
+    return them. ``kv_pairs``: the global layers' KV heads sit on chip pairs at TP over a one-row mesh's columns (the
+    31B on the (1,8) line), which selects the line profile with the pair-split decode attention and the prefix-LSE
+    verify. ``create_tt_model`` calls it before keying the weight cache (the profile decides which tensorbins a build
+    needs: the pair QKV / o_proj copies), ``Gemma4Model`` before building its layers."""
+    mesh_shape = tuple(int(d) for d in mesh_shape)
+    kv_pairs = False
+    if len(mesh_shape) == 2 and mesh_shape[0] == 1:
+        for i in range(hf_config.num_hidden_layers):
+            cfg = Gemma4AttentionConfig(hf_config, i)
+            if not cfg.is_sliding:
+                kv_pairs = (
+                    pair_split_reason(
+                        is_sliding=False,
+                        num_q_heads=cfg.num_attention_heads,
+                        num_kv_heads=cfg.num_key_value_heads,
+                        tp=mesh_shape[1],
+                        mesh_shape=mesh_shape,
+                        kv_replicated=cfg.num_key_value_heads < mesh_shape[1],
+                    )
+                    is None
+                )
+                break
+    return set_decode_fusion_profile(
+        mesh_shape,
+        blackhole=is_blackhole() if blackhole is None else blackhole,
+        moe=hf_config.enable_moe_block,
+        kv_pairs=kv_pairs,
+    )
 
 
 class Gemma4Model:
@@ -456,32 +487,9 @@ class Gemma4Model:
         transformation_mats=None,
     ):
         self.mesh_device = mesh_device
-        # The 4-chip Blackhole MoE build runs the fused decode step by default (tt/mesh_orientation.py, every
-        # GEMMA4_* flag still an override); recorded before the layers are built since the weight loaders and
-        # the norm modules read the switches at construction.
-        # kv_pairs: the global layers' KV heads sit on chip pairs at TP over a one-row mesh's columns (the 31B on the
-        # (1,8) line) -- the line profile then adds the pair-split decode attention and the prefix-LSE verify.
-        mesh_shape = tuple(mesh_device.shape)
-        kv_pairs = False
-        if len(mesh_shape) == 2 and mesh_shape[0] == 1:
-            for i in range(hf_config.num_hidden_layers):
-                cfg = Gemma4AttentionConfig(hf_config, i)
-                if not cfg.is_sliding:
-                    kv_pairs = (
-                        pair_split_reason(
-                            is_sliding=False,
-                            num_q_heads=cfg.num_attention_heads,
-                            num_kv_heads=cfg.num_key_value_heads,
-                            tp=mesh_shape[1],
-                            mesh_shape=mesh_shape,
-                            kv_replicated=cfg.num_key_value_heads < mesh_shape[1],
-                        )
-                        is None
-                    )
-                    break
-        set_decode_fusion_profile(
-            mesh_shape, blackhole=is_blackhole(), moe=hf_config.enable_moe_block, kv_pairs=kv_pairs
-        )
+        # The build profile (fused decode defaults, the pair split on the (1,8) line) is recorded before the layers
+        # are built, since the weight loaders and the norm modules read the switches at construction.
+        apply_build_profile(tuple(mesh_device.shape), hf_config)
         # Keep prompt-dependent slice bounds in persistent buffers. Literal
         # offsets compile a new program after prefill traces are already live.
         self._tail_slice_start = ttnn.from_torch(
@@ -2713,10 +2721,14 @@ class Gemma4Model:
     def _prefill_seq_parallel_applies(self, hidden_states, is_decode, batch_size) -> bool:
         """GEMMA4_PREFILL_SEQ_PARALLEL=1 on an eager single-user dense prefill over a TP axis whose rows split into
         whole tiles per chip (S % (32 tp) == 0). Excluded: decode, batched prefill, the prefill trace, fractured /
-        lane-sharded meshes, MoE layers, per-layer inputs and dFlash taps (they read the full residual)."""
-        from models.demos.gemma4.tt.ccl import prefill_seq_parallel_enabled
+        lane-sharded meshes, MoE layers, per-layer inputs and dFlash taps (they read the full residual), and a mesh
+        opened without an L1_SMALL region: its reduce-scatter / all-to-all make their semaphores on every new
+        prefill length, in worker L1 a captured decode trace rewrites (``ccl_semaphores_in_l1_small``)."""
+        from models.demos.gemma4.tt.ccl import ccl_semaphores_in_l1_small, prefill_seq_parallel_enabled
 
         if is_decode or batch_size != 1 or not prefill_seq_parallel_enabled():
+            return False
+        if not ccl_semaphores_in_l1_small(self.mesh_device):
             return False
         mc = self.mesh_config
         if mc is None or int(getattr(mc, "tp", 1) or 1) <= 1:

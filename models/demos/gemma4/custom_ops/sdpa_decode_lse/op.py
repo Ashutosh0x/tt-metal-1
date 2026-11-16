@@ -189,9 +189,9 @@ class SdpaDecodeLse:
         c = compute_kernel_config
         return (
             c.math_fidelity,
-            bool(getattr(c, "math_approx_mode", True)),
-            bool(getattr(c, "fp32_dest_acc_en", False)),
-            bool(getattr(c, "dst_full_sync_en", False)),
+            bool(c.math_approx_mode),
+            bool(c.fp32_dest_acc_en),
+            bool(c.dst_full_sync_en),
         )
 
     @classmethod
@@ -333,7 +333,7 @@ class SdpaDecodeLse:
         gx, gy = plan.cores.grid
         if gx > int(dev_grid.x) or gy > int(dev_grid.y):
             return f"program grid {gx}x{gy} exceeds the device grid {int(dev_grid.x)}x{int(dev_grid.y)}"
-        budget = sdpa_decode_cb_budget_bytes(getattr(device, "arch", lambda: None)())
+        budget = sdpa_decode_cb_budget_bytes(device.arch())
         if plan.cb_total_bytes > budget:
             return f"circular buffers need {plan.cb_total_bytes} B per core, budget {budget} B: {plan.describe()}"
         return None
@@ -382,7 +382,10 @@ class SdpaDecodeLse:
             compute_kernel_config=compute_kernel_config,
             pair_split=bool(pair_split),
         )
-        reason = cls.unsupported_reason(q, k_cache, v_cache, cur_pos, page_table, memory_config=memory_config, **kw)
+        # a half-block call that leaves the column parity to the mesh (half None) runs one program per parity: the
+        # pair split's mesh rule (a one-row mesh with even columns) applies to it as well
+        check = dict(kw, pair_split=bool(pair_split) or (bool(half_block) and half is None))
+        reason = cls.unsupported_reason(q, k_cache, v_cache, cur_pos, page_table, memory_config=memory_config, **check)
         assert reason is None, f"sdpa_decode_lse: {reason}"
         plan = cls.plan(q, k_cache, v_cache, cur_pos, page_table, **kw)
         g, cores = plan.geometry, plan.cores

@@ -427,9 +427,8 @@ SPLITK_MIN_PREFIX_ENV = "GEMMA4_PREFILL_SDPA_SPLITK_MIN_PREFIX"
 
 def _splitk_eligible(q_chunk, k_cache, v_cache, page_table, chunk_start, geometry, program_config):
     """Whether this chunked-prefill call takes ``SdpaPrefillSplitK`` (opt-in ``GEMMA4_PREFILL_SDPA_SPLITK=1``): a
-    host chunk start of at least ``GEMMA4_PREFILL_SDPA_SPLITK_MIN_PREFIX`` tokens (default 16384; one BH chip, 4 Q /
-    1 KV heads, head_dim 512, 4096 rows: 14.1 -> 10.8 ms at 16K, 50.8 -> 36.5 at 64K, 99.9 -> 71.8 at 128K), a
-    geometry where the split pays on this chip (``SdpaPrefillSplitK.pays``) and a call the op supports
+    host chunk start of at least ``GEMMA4_PREFILL_SDPA_SPLITK_MIN_PREFIX`` tokens (default 16384; the measurements are
+    in custom_ops/sdpa_prefill_splitk/op.py), a geometry where the split pays on this chip (``SdpaPrefillSplitK.pays``) and a call the op supports
     (``SdpaPrefillSplitK.unsupported_reason``); everything else keeps the stock op."""
     if os.environ.get(SPLITK_ENV, "0") != "1" or program_config is None:
         return False

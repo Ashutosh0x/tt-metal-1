@@ -5,7 +5,7 @@
 
 On a one-row mesh with KV heads replicated across TP (the 31B on the Galaxy (1,8) row: 32 q / 4 KV heads, TP=8,
 device column ``i`` holds KV head ``i // 2`` and q heads ``[4i, 4i + 4)``), columns ``2g`` and ``2g + 1`` hold the
-same KV head and today both read its whole KV sequence every decode step. Under the pair split each chip of the
+same KV head and, without the split, both read its whole KV sequence every decode step. Under the pair split each chip of the
 pair ``g`` runs the attention of ALL ``2 * Hq / tp`` q heads of the KV group (``8g .. 8g + 7``) over HALF the key
 chunks (half ``c % 2``, ``SdpaDecodeLse(pair_split=True)``), normalised over that half, with its row statistics.
 The two halves are merged through their log-sum-exp: ``w_c = sigmoid(lse_c - lse_{c^1})``, and each chip feeds
@@ -51,8 +51,8 @@ def log_once(message: str):
 
 
 def pair_split_enabled() -> bool:
-    """The knob: ``GEMMA4_SDPA_PAIR_SPLIT=1`` (``decode_flag``: the env when set, else the build profile; no profile
-    turns it on, so it is off by default)."""
+    """The knob: ``GEMMA4_SDPA_PAIR_SPLIT=1`` (``decode_flag``: the env when set, else the build profile: on in
+    ``GALAXY_LINE_PAIR_ON``, the 31B on the (1,8) line; off elsewhere)."""
     return decode_flag(PAIR_SPLIT_ENV) == "1"
 
 

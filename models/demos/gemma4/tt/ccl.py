@@ -105,7 +105,7 @@ def allreduce_gather_sum_enabled() -> bool:
 # One-shot decode all-reduce (GEMMA4_CCL_ONESHOT): the row-parallel decode matmuls (attention o_proj, MLP down_proj)
 # keep their partial sums in the DRAM-sharded kernel's L1 width-sharded output layout and ONE
 # ``ttnn.experimental.all_reduce_async(x, scratch, ...)`` gathers every chip's shards into an L1 scratch tensor and
-# reduces them locally (the ``gemma4_12b_qb2`` demo's ``MeshCCL.all_reduce``), instead of the reduce-scatter +
+# reduces them locally, instead of the reduce-scatter +
 # all-gather composite (``sync_all_reduce``). Two slots, "o" and "down", each with a pair of rotating global
 # semaphores created with the manager: consecutive uses of one slot are separated by the other slot's all-reduce
 # (o -> down -> next layer's o), which no chip completes before every chip has finished reading the first slot, and
@@ -150,13 +150,8 @@ def default_ccl_oneshot(mesh_shape=None) -> bool:
     thresholds' precision; with fp32 destination accumulation 29 / 30 and one node 6e-6 lower at the same step
     time); the bfp8 payload lowers 26 / 30 nodes by 1e-5..9e-5 and stays excluded.
 
-    Measured basis for (1,8), the Blackhole Galaxy DP4 engine (2026-11-07, the six port knobs together on the
-    BLACKHOLE_GALAXY entries, same seeds, 0 throws): 12B greedy 128/1K c1 68.6 -> 89.0 tok/s/u, sampled c1 +10 %,
-    prose c1 / c16 / c32 +8 / +14 / +7 %, TTFT lower at every point, GPQA subset 31/40 = base; 31B greedy c1
-    51.8 -> 55.8, sampled c1 +5 %, prose c1 / c16 / c32 +6 / +8 / +9 %, greedy after sampled +21 %, GPQA subset
-    65/80 with the six knobs vs 66/80 base over two rounds (five knobs without the wide grid 34/40, without the
-    one-shot 36/40: all within noise). The P150x8 Loudbox shares the arch and the shape and is unmeasured; the
-    T3K (Wormhole) is excluded by the arch guard.
+    (1,8) stays off although faster at short context: it garbles long-context decode on two Galaxy rows (see
+    ``_ONESHOT_DEFAULT_ON_SHAPES``).
     """
     if mesh_shape is None or not is_blackhole():
         return False
@@ -840,20 +835,20 @@ def ccl_lane_scatter_rows(tensor, mesh_config, memory_config=None, ccl_manager=N
     return reduced
 
 
-# GEMMA4_PREFILL_SEQ_PARALLEL=1 (opt-in): a dense single-user prefill keeps the residual stream row-sharded over the
+# GEMMA4_PREFILL_SEQ_PARALLEL (on in the dense fused builds, mesh_orientation.DENSE_DECODE_FUSION_ON): a dense
+# single-user prefill keeps the residual stream row-sharded over the
 # TP axis (each chip holds S / tp rows). The row-parallel o_proj / down_proj partial sums are reduce-scattered over
 # rows instead of all-reduced, the norms and residual adds between them run on the chip's own rows only, and the
 # next normed input is all-gathered over rows: the same reduce-scatter + all-gather bytes as the all-reduce composite,
 # 1 / tp of the norm and add work (every chip normed all S replicated rows before). Model side: model.py
 # (_prefill_seq_parallel_applies, mesh_partition before the layers, the row all-gather after) and layer.py.
-PREFILL_SEQ_PARALLEL_ENV = "GEMMA4_PREFILL_SEQ_PARALLEL"
 _DEFER_TP_REDUCE = contextvars.ContextVar("gemma4_defer_tp_reduce", default=False)
 
 
 def prefill_seq_parallel_enabled() -> bool:
     """``GEMMA4_PREFILL_SEQ_PARALLEL``: the row-sharded residual for dense single-user prefill (the env when set, else
-    the build profile: on for the 31B (1,8) line, mesh_orientation.GALAXY_LINE_PAIR_ON; off elsewhere)."""
-    from models.demos.gemma4.tt.mesh_orientation import decode_flag
+    the build profile: on in the dense fused builds, the dense Blackhole (1,4) / (1,8) meshes; off elsewhere)."""
+    from models.demos.gemma4.tt.mesh_orientation import PREFILL_SEQ_PARALLEL_ENV, decode_flag
 
     return decode_flag(PREFILL_SEQ_PARALLEL_ENV) == "1"
 

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""GEMMA4_KV_FUSED_UPDATE (item 11 of the gemma4_12b_qb2 port): the fused K+V paged cache write, one
+"""GEMMA4_KV_FUSED_UPDATE: the fused K+V paged cache write, one
 ``paged_fused_update_cache`` program per layer, equals the two ``paged_update_cache`` programs bit for bit.
 
 One decode step of a ``Gemma4Attention`` layer on a fresh paged cache, knob off and knob on from the same seed: every

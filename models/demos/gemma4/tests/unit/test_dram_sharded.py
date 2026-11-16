@@ -352,17 +352,26 @@ def test_prefill_fp32_acc_fits_l1(mesh_device, device_params, K, N, M):
     assert pcc > 0.9995, f"pcc vs torch {pcc}"
 
 
-# ===== GEMMA4_PREFILL_WIDE_GRID (item 10 of the gemma4_12b_qb2 port): the wide short-row 2D config (grid width over
+# ===== GEMMA4_PREFILL_WIDE_GRID: the wide short-row 2D config (grid width over
 # the exact divisors of the N tiles up to the device grid, in0_block_w up to 8 within the L1 budget) against the
 # narrow one (<= 8 columns, in0 <= 4): the same accuracy against torch (HiFi2 + fp32 Dest in both) on the 12B TP=4
 # shapes, from the 4 row tiles of a 128-token prompt to the slab and the chunked 4096-row form; the traced time of
 # both is printed (RESULT lines) for the perf verdict.
 _WIDE_12B_TP4 = [(3840, 2048), (1024, 3840), (3840, 7680), (3840, 3840)]
 _WIDE_12B_IDS = ["wqkv12b_tp4", "oproj12b_tp4", "gateup12b_tp4", "down12b_tp4"]
+# the 26B's sliding-layer QKV and o_proj at TP4 (hidden 2816 = 88 N tiles, an 11-column split on the wide grid)
+_WIDE_26B_TP4 = [(2816, 2048), (1024, 2816)]
+_WIDE_26B_IDS = ["wqkv26b_tp4", "oproj26b_tp4"]
+_WIDE_CASES = [
+    pytest.param(k, n, m, id=f"{name}-m{m}")
+    for (k, n), name in zip(_WIDE_12B_TP4, _WIDE_12B_IDS)
+    for m in (128, 256, 1024, 2560, 4096)
+] + [
+    pytest.param(k, n, m, id=f"{name}-m{m}") for (k, n), name in zip(_WIDE_26B_TP4, _WIDE_26B_IDS) for m in (128, 4096)
+]
 
 
-@pytest.mark.parametrize("K, N", _WIDE_12B_TP4, ids=_WIDE_12B_IDS)
-@pytest.mark.parametrize("M", [128, 256, 1024, 2560, 4096], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("K, N, M", _WIDE_CASES)
 @pytest.mark.parametrize("mesh_device, device_params", SINGLE_CHIP, indirect=True)
 def test_prefill_wide_grid_matches_narrow(mesh_device, device_params, K, N, M, monkeypatch):
     from models.demos.gemma4.tt.compute_config import prefill_linear_compute_kernel_config

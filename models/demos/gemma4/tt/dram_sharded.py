@@ -357,8 +357,8 @@ PREFILL_WIDE_IN0_CAP = max(1, int(os.environ.get("GEMMA4_PREFILL_WIDE_IN0_CAP", 
 
 
 def prefill_wide_grid_default(mesh_device, k=None, n=None) -> bool:
-    """Whether a weight's short-row prefill matmuls take the wide 2D grid (item 10 of the gemma4_12b_qb2 port,
-    ``prefill_wide_progcfg``): the grid width goes to the device's worker-grid width over the exact divisors of the
+    """Whether a weight's short-row prefill matmuls take the wide 2D grid
+    (``prefill_wide_progcfg``): the grid width goes to the device's worker-grid width over the exact divisors of the
     N tiles (the 12B TP=4 gate_up / down / o_proj: 10 columns instead of 6, 40 cores instead of 24 for the 4 row
     tiles of a 128-token prompt) and in0_block_w to the largest divisor of the K tiles up to
     ``PREFILL_WIDE_IN0_CAP`` whose static CBs fit the L1 budget (fp32 partials included: the HiFi2 + fp32 Dest

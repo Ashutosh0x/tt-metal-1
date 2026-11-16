@@ -136,7 +136,12 @@ class QkvHeadsNormRope:
         mem = heads_sharded_memory_config(device, B, D)
         v_mem = mem if v_memory_config is None else v_memory_config
         if v_memory_config is not None:
+            assert (
+                v_memory_config.memory_layout == ttnn.TensorMemoryLayout.HEIGHT_SHARDED
+                and v_memory_config.buffer_type == ttnn.BufferType.L1
+            ), "v_memory_config: HEIGHT_SHARDED in L1"
             v_spec = v_memory_config.shard_spec
+            assert v_spec.orientation == ttnn.ShardOrientation.ROW_MAJOR, "v_memory_config: row-major shard cores"
             assert (
                 list(v_spec.shape) == [TILE, D] and v_spec.grid.num_cores() >= B
             ), "v_memory_config: one user per core"

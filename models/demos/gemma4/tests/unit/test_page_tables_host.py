@@ -244,7 +244,7 @@ def test_prefill_row_record_is_off_for_the_batched_form():
     assert Mixin._g4_prefill_row_record("x", 0) is None
 
 
-# ===== GEMMA4_SHARE_PAGE_TABLES (item 5 of the gemma4_12b_qb2 port): the layers of one vLLM KV-cache group slot
+# ===== GEMMA4_SHARE_PAGE_TABLES: the layers of one vLLM KV-cache group slot
 # share one persistent device buffer; the slots follow the layer types (page_table_group_slots), never the host
 # objects a call carries, so the warmup's broadcast table and the first request's per-group tables land on the
 # same buffers (no reallocation under the captured traces, the 2026-11-05 hang).

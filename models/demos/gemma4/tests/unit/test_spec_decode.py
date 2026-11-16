@@ -3330,7 +3330,7 @@ _SERVING_SHAPES = [(1, 5), (5, 5), (8, 3), (16, 1)]
 # The serving tests capture the records' traces and then run eager plain references (and reseeds): a collective
 # first compiled after a capture puts its global semaphores in worker L1 unless the mesh has an L1_SMALL region, and
 # the records' replays overwrite them there (the eager reference then drifts or garbles from the second pass on:
-# test_ccl_semaphores.py, tt/ccl.py ccl_semaphores_in_l1_small). Open the mesh with the region, as the test factory does.
+# test_model.py's semaphore case, tt/ccl.py ccl_semaphores_in_l1_small). Open the mesh with the region, as the test factory does.
 _SERVING_DEVICE_PARAMS = {
     "fabric_config": ttnn.FabricConfig.FABRIC_1D,
     "trace_region_size": 400_000_000,

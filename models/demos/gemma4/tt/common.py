@@ -26,7 +26,7 @@ from models.demos.gemma4.config import MeshConfig, ModeConfig
 from models.demos.gemma4.tt.assistant.model import Gemma4AssistantModel
 from models.demos.gemma4.tt.ccl import CCLManager, mesh_tp_axis
 from models.demos.gemma4.tt.mesh_orientation import dispatch_prefill_default
-from models.demos.gemma4.tt.model import Gemma4Model
+from models.demos.gemma4.tt.model import Gemma4Model, apply_build_profile
 from models.demos.gemma4.tt.model_config import Gemma4AssistantArgs, Gemma4ModelArgs
 from models.demos.gemma4.tt.precision import Gemma4Precision
 from models.demos.gemma4.tt.sdpa_pair_split import pair_split_enabled, pair_split_mesh
@@ -255,7 +255,9 @@ def create_tt_model(
     # ceiling at long context.
     _precision_for_variant = Gemma4Precision.load(model_path, _worker_mesh, max_seq_len=max_seq_len)
     # The variant must also pin every knob that decides WHICH tensorbin FILENAMES a build needs, not
-    # only their dtype (see gemma4_cache_layout).
+    # only their dtype (see gemma4_cache_layout). The build profile is one of them (the (1,8) line's pair split
+    # adds the pair QKV / o_proj copies), so it is recorded first; Gemma4Model records the same profile again.
+    apply_build_profile(_worker_mesh, model_args)
     _cache_layout = gemma4_cache_layout(mesh_device, mesh_config)
     cache_identity = dict(
         # vLLM hands over the resolved hub snapshot dir, not the HF id: keyed on the plain

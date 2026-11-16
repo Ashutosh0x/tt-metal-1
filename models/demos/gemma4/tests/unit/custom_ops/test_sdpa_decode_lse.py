@@ -12,7 +12,12 @@ program config):
 * the program-cache repeat (bitwise) and the out-of-contract refusals;
 * the pair split on a (1, 2) mesh (``pair_split=True``, the same inputs replicated on both chips): each chip's
   half (its O and LSE against torch over that half's keys, the empty-half sentinel), the two merged against the
-  single full call and torch, the program-cache repeat.
+  single full call and torch, the model's device merge (``pair_merge``: the gathered LSEs and the selector) per chip
+  and summed, the program-cache repeat;
+* ``sdpa_prefill_splitk`` (inside the pair-merge cases): the pair-sharded prefill's three-way merge, the served
+  causal call against torch and the stock chunked SDPA, and a served-like shape (several Q chunks, the automatic
+  split count): the plan covers every (head, q chunk, k chunk) once, the merged statistics' LSE against torch, a
+  fixed split count at two chunk starts as one program (a cache hit).
 
 Torch thresholds: the ``fp32_dest`` compute config must beat ``PCC_MIN`` against the fp32 torch golden; the
 ``stock`` config (bf16 dest, the op default) measures 0.9974-0.9986 against it on these random inputs, so there the
@@ -56,6 +61,124 @@ SCALE = 1.0  # the model's scale
 gated = pytest.mark.skipif(
     not os.environ.get(GATE_ENV), reason=f"device checks of sdpa_decode_lse: set {GATE_ENV}=1 to run them"
 )
+
+
+def _owned_read_tables(page_table, cur_pos, block_size):
+    """The ``owned`` mode's per-half read tables over one unsharded cache: block-parity ownership (logical block ``b``
+    on pair half ``b % 2``), each half's owned blocks among a row's positions ``0 .. cur_pos // block_size`` in
+    position order (padding 0), and the last valid index of that compacted sequence (``-1`` when the half owns none
+    of the row's blocks or the row is inactive). Returns ``(tables [2, B, W] int32, cur_pos_h [2, B] int32)``."""
+    pt = page_table.to(torch.int64)
+    B, W = pt.shape
+    bs = int(block_size)
+    tables = torch.zeros((2, B, W), dtype=torch.int64)
+    pos_h = torch.full((2, B), -1, dtype=torch.int64)
+    for b in range(B):
+        cp = int(cur_pos[b])
+        if cp < 0:
+            continue
+        last = cp // bs
+        tail = cp % bs + 1
+        for h in (0, 1):
+            owned = [j for j in range(last + 1) if int(pt[b, j]) % 2 == h]
+            if not owned:
+                continue
+            tables[h, b, : len(owned)] = pt[b, owned]
+            full = len(owned) - (1 if owned[-1] == last else 0)
+            pos_h[h, b] = full * bs + (tail if owned[-1] == last else 0) - 1
+    return tables.to(torch.int32), pos_h.to(torch.int32)
+
+
+def _check_splitk_served_shape(mesh_device, case, row, length, Hq, ckc):
+    """SdpaPrefillSplitK on a served-like call over ``row``'s first ``length`` cached keys: several Q chunks
+    (Sq 4096 after a 16K prefix when the row is that long, else 2048 after 2048), the automatic split count, so a core
+    runs several pieces and the causal diagonal sits past the first Q chunk; the plan covers every (head, q chunk, k
+    chunk) once; the output against torch and the stock chunked SDPA, the merged statistics' LSE against torch; then
+    a fixed split count at two chunk starts with the same row count, the second a program-cache hit."""
+    from models.demos.gemma4.custom_ops.grid import compute_grid
+    from models.demos.gemma4.custom_ops.sdpa_prefill_splitk.op import plan_pieces
+
+    chunk = 128
+    cs, sq = (16384, 4096) if length >= 16384 + 4096 else (2048, 2048)
+    gx, gy = compute_grid(mesh_device)
+
+    def covered(start, splits=None):
+        plan = plan_pieces(Hq, sq // chunk, start // chunk, gx * gy, splits=splits)
+        seen = {}
+        for pieces in plan.cores:
+            for h, qi, lo, hi, _ in pieces:
+                seen.setdefault((h, qi), []).append((lo, hi))
+        for h in range(Hq):
+            for qi in range(sq // chunk):
+                spans = sorted(seen.pop((h, qi)))
+                assert spans[0][0] == 0 and spans[-1][1] == start // chunk + qi + 1, (h, qi, spans)
+                assert all(a[1] == b[0] for a, b in zip(spans, spans[1:])), (h, qi, spans)
+        assert not seen, f"pieces outside the call: {sorted(seen)[:4]}"
+        return plan
+
+    plan = covered(cs)
+    fixed = covered(cs, splits=4)
+    assert max(len(c) for c in fixed.cores) > 1, "4 splits: expected several pieces on a core"
+
+    pos_k = torch.arange(cs + sq)
+    keys = case.k_ref[case.table[row, pos_k // BLOCK].long(), 0, pos_k % BLOCK].float()
+    values = case.v_ref[case.table[row, pos_k // BLOCK].long(), 0, pos_k % BLOCK].float()
+    q = (torch.randn(1, Hq, sq, D) * Q_STD).to(torch.bfloat16)
+    tt_q = ttnn.from_torch(q, device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, **case.rep)
+    _, tt_row = case.tensors(torch.tensor([length - 1]), case.table[row : row + 1].contiguous())
+    kw = dict(num_kv_heads=1, block_size=BLOCK, compute_kernel_config=ckc)
+
+    def reference(start):
+        k, v = keys[: start + sq], values[: start + sq]
+        s = (q[0].float() @ k.T) * SCALE
+        visible = torch.arange(start + sq)[None, :] <= (torch.arange(sq)[:, None] + start)
+        s = s.masked_fill(~visible, float("-inf"))
+        return torch.softmax(s, dim=-1) @ v, torch.logsumexp(s, dim=-1)
+
+    out, stats = SdpaPrefillSplitK.op(tt_q, case.k_cache, case.v_cache, tt_row, cs, merge_stats=True, **kw)
+    ref, lse_ref = reference(cs)
+    got = case.host(out)[0].float()
+    st = case.host(stats)[0].float()
+    lse = SCALE * st[..., 0] + torch.log(st[..., P.TILE])
+    stock = ttnn.transformer.chunked_scaled_dot_product_attention(
+        tt_q,
+        case.k_cache,
+        case.v_cache,
+        tt_row,
+        chunk_start_idx=cs,
+        scale=SCALE,
+        program_config=ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=mesh_device.compute_with_storage_grid_size(),
+            q_chunk_size=chunk,
+            k_chunk_size=chunk,
+            exp_approx_mode=False,
+        ),
+        compute_kernel_config=ckc,
+    )
+    pcc, pcc_stock = _pcc(got, ref), _pcc(case.host(stock)[0].float(), ref)
+    lse_err = (lse - lse_ref).abs().max().item()
+    logger.info(
+        f"split-K served shape: {Hq} heads x {sq} rows after {cs}, {plan.splits} splits, <= "
+        f"{max(len(c) for c in plan.cores)} pieces per core: pcc {pcc:.6f} (stock {pcc_stock:.6f}), "
+        f"max |lse - torch| {lse_err:.4f}"
+    )
+    assert pcc >= PCC_MIN and pcc >= pcc_stock - 1e-4, f"split-K {pcc:.6f} vs stock {pcc_stock:.6f}"
+    assert lse_err <= 0.05 + 0.01 * lse_ref.abs().max().item(), f"merged lse off by {lse_err:.4f}"
+    for t in (out, stats, stock):
+        t.deallocate(True)
+
+    # a fixed split count at two chunk starts with the same rows: one program, the second call a cache hit
+    entries = None
+    for start in (cs, cs - 512):
+        res = SdpaPrefillSplitK.op(tt_q, case.k_cache, case.v_cache, tt_row, start, splits=4, **kw)
+        pcc_s = _pcc(case.host(res)[0].float(), reference(start)[0])
+        res.deallocate(True)
+        assert pcc_s >= PCC_MIN, f"split-K splits=4 at {start}: pcc {pcc_s:.6f}"
+        n = mesh_device.num_program_cache_entries()
+        assert entries is None or n == entries, f"chunk start {start}: {n - entries} new program(s), expected a hit"
+        entries = n
+    tt_q.deallocate(True)
+    tt_row.deallocate(True)
 
 
 def _pcc(a, b):
@@ -324,9 +447,7 @@ def test_sdpa_decode_lse_pair_merge_matches_full(mesh_device, device_params, B, 
     _assert_merged_vs_torch(cfg, pcc_ref, pcc_full_ref)
     assert lse_err <= 0.05 + 0.01 * lse_full[live].abs().max().item()
 
-    from models.demos.gemma4.tt.kv_pair_shard import owned_read_tables
-
-    tables, pos_h = owned_read_tables(case.table, cur_pos, BLOCK, int(case.table.max()) + 1, logical=True)
+    tables, pos_h = _owned_read_tables(case.table, cur_pos, BLOCK)
     out_0, lse_0, _ = case.run(pos_h[0], tables[0], pc, ckc, owned=True)
     out_1, lse_1, _ = case.run(pos_h[1], tables[1], pc, ckc, owned=True)
     owned, lse_o = SdpaDecodeLse.merge_torch(out_0, lse_0, out_1, lse_1)
@@ -342,7 +463,7 @@ def test_sdpa_decode_lse_pair_merge_matches_full(mesh_device, device_params, B, 
     # one-block rows: the non-owner half writes the sentinel on a live row and the merge takes the owner alone
     short = torch.where(cur_pos >= 0, torch.clamp(cur_pos, max=BLOCK // 2), cur_pos)
     full_s, lse_full_s, _ = case.run(short, case.table, pc, ckc)
-    tables_s, pos_s = owned_read_tables(case.table, short, BLOCK, int(case.table.max()) + 1, logical=True)
+    tables_s, pos_s = _owned_read_tables(case.table, short, BLOCK)
     assert all((int(pos_s[0, b]) < 0) != (int(pos_s[1, b]) < 0) for b in live), pos_s
     o0, l0, _ = case.run(pos_s[0], tables_s[0], pc, ckc, owned=True)
     o1, l1, _ = case.run(pos_s[1], tables_s[1], pc, ckc, owned=True)
@@ -509,6 +630,7 @@ def test_sdpa_decode_lse_pair_merge_matches_full(mesh_device, device_params, B, 
         )
         assert pcc_ps >= PAIR_PCC_MIN, f"pair-split prefill vs torch pcc {pcc_ps:.6f}"
         assert pcc_sk >= PCC_MIN and pcc_sk >= pcc_stock - 1e-4, f"split-K {pcc_sk:.6f} vs stock {pcc_stock:.6f}"
+        _check_splitk_served_shape(mesh_device, case, row, int(cur_pos[row]) + 1, Hq, pf_ckc)
         for t in (o_0, st_0, o_1, st_1, o_c, st_c, o_all, st_all, fk, fv, ident, tt_full_row, served):
             t.deallocate(True)
     pf_tt_q.deallocate(True)
@@ -720,6 +842,37 @@ def test_sdpa_decode_lse_pair_split_on_two_chips(mesh_device, device_params, B, 
     assert pcc_full >= PAIR_PCC_MIN, f"merged vs full pcc {pcc_full:.6f}"
     _assert_merged_vs_torch(cfg, pcc_ref, pcc_full_ref)
     assert lse_err <= 0.05 + 0.01 * lse_full[live].abs().max().item(), f"merged lse off by {lse_err:.4f}"
+
+    # the model's device merge (tt/attention/decode.py pair_merge): the LSEs all-gathered over the row and picked by
+    # each chip's selector row; each chip's w_self * O_self against the host merge's term for its half (a swapped
+    # gather order swaps the weights), and the two summed (the o_proj's TP reduction) against the full call
+    from models.demos.gemma4.config import MeshConfig, ModeConfig
+    from models.demos.gemma4.tt.attention.decode import pair_merge
+    from models.demos.gemma4.tt.ccl import CCLManager
+    from models.demos.gemma4.tt.sdpa_pair_split import pair_selector
+
+    mesh_config = MeshConfig(mesh_device.shape, decode=ModeConfig(tp=2), tp_axis=1)
+    selector = ttnn.from_torch(
+        pair_selector(2),
+        dtype=ttnn.float32,
+        layout=ttnn.TILE_LAYOUT,
+        device=mesh_device,
+        mesh_mapper=mesh_config.shard_mapper(mesh_device, tensor_dim=1),
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    out_d, stats_d = SdpaDecodeLse.op(
+        *args, pair_split=True, memory_config=ttnn.DRAM_MEMORY_CONFIG, stats_memory_config=ttnn.DRAM_MEMORY_CONFIG, **kw
+    )
+    w_out = pair_merge(out_d, stats_d, selector, mesh_config, CCLManager(mesh_device, num_links=1), scale=SCALE)
+    terms = [ttnn.to_torch(t)[0, :, :Hq].float() for t in ttnn.get_device_tensors(w_out)]
+    for h, host_term in ((0, w0 * halves[0]), (1, w1 * halves[1])):
+        pcc_t = _pcc(terms[h][live], host_term[live])
+        assert pcc_t >= PCC_MIN, f"half {h}: device pair_merge term vs host pcc {pcc_t:.6f}"
+    pcc_dev = _pcc((terms[0] + terms[1])[live], full[live])
+    logger.info(f"B={B} Hq={Hq} pos={pos} {cfg}: device pair_merge summed vs full pcc {pcc_dev:.6f}")
+    assert pcc_dev >= PCC_MIN, f"device pair_merge vs full pcc {pcc_dev:.6f}"
+    for t in (w_out, selector):
+        t.deallocate(True)
 
     # the program-cache repeat (fresh output buffers): the same bits on both chips
     halves2, stats2 = pair_call()

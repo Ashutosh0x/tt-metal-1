@@ -6,6 +6,9 @@
 // w_j = exp((m_j - M) * scale) * l_j with M = max_j m_j (every exponential <= 1), and the merged row is
 // O = sum_j O_j * w_j / sum_j w_j (O_j softmax-normalised over slot j's keys). Weights in fp32 dest; the weighted
 // sum accumulates in an fp32 CB (L1 accumulation), then packs to the output format.
+// Every acquire window issues all its copies (FPU) before its first SFPU op: an FPU write to a dest tile that an
+// earlier SFPU op of the same window read corrupts the result (README "Kernel traps"). Running values (M, L) pass
+// between windows through their 1-tile fp32 CBs.
 
 #include <cstdint>
 
@@ -66,11 +69,15 @@ void kernel_main() {
         stats.wait_front(2 * S);
         reconfig_data_format_srca(cb_stats_in);
 
-        // M = max_j m_j as M + relu(m_j - M)
+        // M = max_j m_j as M + relu(m_j - M), the running M in cb_max between the slots' windows
         pack_reconfig_data_format(cb_max);
         tile_regs_acquire();
         load<cb_stats_in>(0, 0);
+        pack_one<cb_max>(0);
         for (uint32_t j = 1; j < S; ++j) {
+            mx.wait_front(1);
+            tile_regs_acquire();
+            load<cb_max>(0, 0);
             load<cb_stats_in>(j, 1);
             sub_binary_tile_init();
             sub_binary_tile(1, 0, 1);
@@ -78,8 +85,9 @@ void kernel_main() {
             relu_tile(1);
             add_binary_tile_init();
             add_binary_tile(0, 1, 0);
+            mx.pop_front(1);
+            pack_one<cb_max>(0);
         }
-        pack_one<cb_max>(0);
 
         // w_j = exp((m_j - M) * scale) * l_j
         mx.wait_front(1);
@@ -94,6 +102,7 @@ void kernel_main() {
             tile_regs_acquire();
             load<cb_stats_in>(j, 0);
             load<cb_max>(0, 1);
+            load<cb_stats_in>(S + j, 2);
             sub_binary_tile_init();
             sub_binary_tile(0, 1, 0);
             if constexpr (scale_fp32 != 0x3F800000u) {
@@ -102,27 +111,31 @@ void kernel_main() {
             }
             exp_tile_init();
             exp_tile(0);
-            load<cb_stats_in>(S + j, 1);
             mul_binary_tile_init();
-            mul_binary_tile(0, 1, 0);
+            mul_binary_tile(0, 2, 0);
             pack_one<cb_w>(0);
         }
         mx.pop_front(1);
         stats.pop_front(2 * S);
 
-        // L = sum_j w_j; inv = 1 / L
+        // L = sum_j w_j (the running sum in cb_sum between the slots' windows); inv = 1 / L
         w.wait_front(S);
         reconfig_data_format_srca(cb_w);
         pack_reconfig_data_format(cb_sum);
+        CircularBuffer sum(cb_sum);
         tile_regs_acquire();
         load<cb_w>(0, 0);
+        pack_one<cb_sum>(0);
         for (uint32_t j = 1; j < S; ++j) {
+            sum.wait_front(1);
+            tile_regs_acquire();
+            load<cb_sum>(0, 0);
             load<cb_w>(j, 1);
             add_binary_tile_init();
             add_binary_tile(0, 1, 0);
+            sum.pop_front(1);
+            pack_one<cb_sum>(0);
         }
-        pack_one<cb_sum>(0);
-        CircularBuffer sum(cb_sum);
         sum.wait_front(1);
         if constexpr (with_stats) {
             pack_reconfig_data_format(cb_stats_out);

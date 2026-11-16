@@ -38,6 +38,8 @@ from models.demos.gemma4.tt.generator_trace import (
     normalize_gemma4_model_key,
     resolve_gemma4_demo_long_context,
 )
+from models.demos.gemma4.tt.mesh_orientation import clear_decode_fusion_profile
+from models.demos.gemma4.tt.model import apply_build_profile
 from models.demos.gemma4.tt.model_config import Gemma4ModelArgs
 from models.demos.gemma4.tt.precision import Gemma4Precision
 
@@ -624,10 +626,38 @@ def test_expert_partition_keys_the_cache_layout():
     assert ep4["weight_layout"] == "fractured-tp_axis0"
 
 
-def test_single_device_layout_has_the_trivial_partition():
+def test_single_device_layout_has_the_trivial_partition(monkeypatch):
+    """The trivial partition off a mesh; and the build profile create_tt_model records before keying the layout puts
+    the (1,8) line's pair-split copies in it for the 31B (env unset), not for GEMMA4_SDPA_PAIR_SPLIT=0."""
     layout = gemma4_cache_layout(SimpleNamespace(), None)
     assert layout["expert_partition"] == "ep1tp1_tp_axis1"
     assert layout["weight_layout"] == "tp"
+    gemma31 = SimpleNamespace(
+        num_hidden_layers=6,
+        layer_types=["sliding_attention"] * 5 + ["full_attention"],
+        hidden_size=5376,
+        num_attention_heads=32,
+        rms_norm_eps=1e-6,
+        enable_moe_block=False,
+        attention_k_eq_v=True,
+        num_key_value_heads=16,
+        head_dim=256,
+        sliding_window=1024,
+        rope_theta=1e4,
+        num_global_key_value_heads=4,
+        global_head_dim=512,
+        global_rope_theta=1e6,
+        partial_rotary_factor=0.25,
+    )
+    line = SimpleNamespace(shape=(1, 8))
+    monkeypatch.delenv("GEMMA4_SDPA_PAIR_SPLIT", raising=False)
+    try:
+        apply_build_profile((1, 8), gemma31, blackhole=True)
+        assert gemma4_cache_layout(line, None)["sdpa_pair_split"] == "v1"
+        monkeypatch.setenv("GEMMA4_SDPA_PAIR_SPLIT", "0")
+        assert "sdpa_pair_split" not in gemma4_cache_layout(line, None)
+    finally:
+        clear_decode_fusion_profile()
 
 
 # ===== merged from tests/unit/test_served_weights_dir.py: The loaders read the served checkpoint (MODEL_WEIGHTS_DIR / HF_MODEL) when the path vLLM

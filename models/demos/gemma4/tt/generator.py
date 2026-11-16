@@ -690,7 +690,7 @@ TOKEN_READ_SHARD0_DEFAULT_SHAPES = ((1, 4), (1, 8))
 
 def token_read_shard0_default(mesh_device) -> bool:
     """Whether a decode step's output (the sampler's tokens, or the logits of a host-sampled step) is read back from
-    device 0's replica alone (item 3a of the gemma4_12b_qb2 port) instead of the whole replicated mesh tensor.
+    device 0's replica alone instead of the whole replicated mesh tensor.
 
     Under TP the decode logits are all-gathered inside the model and the device sampler's tokens are replicated, so
     every chip holds the same bytes and ``Gemma4Model.process_output_decode`` consumes shard 0 only; a read of the

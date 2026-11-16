@@ -8,7 +8,7 @@ Gates, on the 12B decode width (H = 3840) in both layouts the 12B row-parallel m
 and down_proj; at TP=4: 8 cores x 480 and 40 cores x 96), on the 4-chip (1,4) mesh and the (1,8) Galaxy DP4 line:
 * the bf16 payload matches the torch sum of the partials at PCC > 0.999 on every chip, and so does the composite
   path's result from the same partials (the two paths agree);
-* the bfp8 payload's PCC is recorded (printed as RESULT lines) and gated loosely (> 0.99);
+* the bfp8 payload at PCC > 0.999 (measured 0.99997 on the (1,4) mesh, 2026-11-06; printed as RESULT lines);
 * a one-row logical input (batch 1 under the row view) comes back as one logical row;
 * repeated use of one slot (the semaphore pair in turn) and of both slots alternately never hangs and keeps the
   result.
@@ -31,7 +31,7 @@ H = 3840  # the 12B hidden size
 HEADS, HEAD_DIM, INTER = 16, 256, 15360  # the 12B o_proj K (heads x head_dim) and down_proj K (intermediate)
 TILE = ttnn.TILE_SIZE
 PCC_BF16 = 0.999
-PCC_BFP8 = 0.99
+PCC_BFP8 = 0.999  # measured 0.99997 (bfp8 rounds each partial once before the sum)
 
 
 def _decode_out_layout(k, n):

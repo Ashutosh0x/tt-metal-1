@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 """Pair-sharded global KV (``GEMMA4_KV_PAIR_SHARD``): host planning for the 31B's global layers on a (1, 8) Galaxy
-row, where each of the 4 global KV heads sits on the two chips of a pair (column c holds head c // 2) and was stored
-in full on both.
+row, where each of the 4 global KV heads sits on the two chips of a pair (column c holds head c // 2), which the
+unsharded layout stores in full on both.
 
 The served layout is the HALF-BLOCK one (``half_block_*`` below): vLLM's hybrid KV manager shares one physical tensor
 and one block pool between each global layer and its sliding layers, so the blocks themselves cannot be split
@@ -21,21 +21,9 @@ slot the logical page table names: one page table for both chips, the global KV 
   device page) and the pair merges the per-half results by log-sum-exp
   (``attention.prefill.pair_split_prefill_attention``).
 
-The block-parity scheme below (ownership by block id, compacted read tables) is not served: it needs a vLLM
-allocator change. Its planner backs the ``owned`` mode of ``custom_ops/sdpa_decode_lse``, tested on its own.
-Block-parity planner -- each chip stores only the logical blocks it OWNS:
-
-* ownership by block-id parity: logical block ``b`` lives on pair half ``h = b % 2`` (column parity) at physical
-  slot ``b // 2``; every chip's global-layer cache holds ``ceil(num_blocks / 2) + 1`` slots, the last one a dummy
-  that non-owner writes land in (``dummy_slot``), so the global KV bytes per chip halve for the same logical pool;
-* writes (``paged_fill_cache`` / the decode cache update, stock ops) go through a per-half WRITE table: the block at
-  position ``j`` maps to ``b // 2`` on its owner and to the dummy on the other half (``write_tables``);
-* decode attention: attention over a row's cached keys is order-invariant (RoPE is applied when K is written), so
-  each half attends ONLY its owned blocks through a COMPACTED read table (owned blocks in position order, padded
-  with the dummy) with an effective ``cur_pos_h`` = owned full blocks x block + the tail of the row's last
-  (partial) block when this half owns it, minus 1 (``owned_read_tables``); a half that owns none of a row's blocks
-  gets ``-1`` and writes the empty-half sentinel, and the two halves merge through their log-sum-exp exactly as the
-  contiguous pair split does (``tt/sdpa_pair_split.py``).
+The block-parity layout (ownership by block id, compacted read tables) is not served: it needs a vLLM allocator
+change. The ``owned`` mode of ``custom_ops/sdpa_decode_lse`` that would read it is tested with its own read-table
+helper (tests/unit/custom_ops/test_sdpa_decode_lse.py).
 
 Pure torch, no device: shared by the model's input preparation and the host tests.
 """
@@ -50,71 +38,6 @@ KV_PAIR_SHARD_ENV = "GEMMA4_KV_PAIR_SHARD"
 def kv_pair_shard_enabled() -> bool:
     """``GEMMA4_KV_PAIR_SHARD=1`` (default off)."""
     return os.environ.get(KV_PAIR_SHARD_ENV, "0") == "1"
-
-
-def physical_slots(num_logical_blocks: int) -> int:
-    """Slots one chip's global-layer cache holds under the shard: its half of the logical blocks plus the dummy."""
-    return (int(num_logical_blocks) + 1) // 2 + 1
-
-
-def dummy_slot(num_logical_blocks: int) -> int:
-    """The slot non-owner writes land in (the last one)."""
-    return physical_slots(num_logical_blocks) - 1
-
-
-def write_tables(page_table: torch.Tensor, num_logical_blocks: int) -> torch.Tensor:
-    """``[2, B, W]`` int32 per-half write tables for a ``[B, W]`` logical page table: owner -> ``b // 2``, the other
-    half -> the dummy slot. Negative (unused) entries map to the dummy on both halves."""
-    pt = page_table.to(torch.int64)
-    dummy = dummy_slot(num_logical_blocks)
-    out = torch.full((2,) + tuple(pt.shape), dummy, dtype=torch.int64)
-    valid = pt >= 0
-    for h in (0, 1):
-        own = valid & (pt % 2 == h)
-        out[h][own] = pt[own] // 2
-    return out.to(torch.int32)
-
-
-def owned_read_tables(
-    page_table: torch.Tensor, cur_pos: torch.Tensor, block_size: int, num_logical_blocks: int, *, logical=False
-) -> tuple:
-    """Per-half compacted read tables and effective positions for decode attention.
-
-    ``page_table [B, W]`` logical ids in position order, ``cur_pos [B]`` (``-1`` = inactive row). Returns
-    ``(tables [2, B, W] int32, cur_pos_h [2, B] int32)``: half ``h``'s table lists the physical slots of the owned
-    blocks among positions ``0 .. cur_pos // block_size`` in position order (dummy-padded), and ``cur_pos_h[h, b]``
-    is the last valid index of that compacted sequence (``-1`` when the half owns none of the row's blocks or the
-    row is inactive). ``logical=True``: the tables hold the logical ids themselves (padding 0) -- a single-chip test
-    of the attention split over one unsharded cache."""
-    pt = page_table.to(torch.int64)
-    B, W = pt.shape
-    dummy = 0 if logical else dummy_slot(num_logical_blocks)
-    bs = int(block_size)
-    tables = torch.full((2, B, W), dummy, dtype=torch.int64)
-    pos_h = torch.full((2, B), -1, dtype=torch.int64)
-    for b in range(B):
-        cp = int(cur_pos[b])
-        if cp < 0:
-            continue
-        last = cp // bs
-        tail = cp % bs + 1
-        for h in (0, 1):
-            owned = [j for j in range(last + 1) if int(pt[b, j]) % 2 == h]
-            if not owned:
-                continue
-            tables[h, b, : len(owned)] = pt[b, owned] if logical else pt[b, owned] // 2
-            full = len(owned) - (1 if owned[-1] == last else 0)
-            pos_h[h, b] = full * bs + (tail if owned[-1] == last else 0) - 1
-    return tables.to(torch.int32), pos_h.to(torch.int32)
-
-
-def merge_halves(out0, lse0, out1, lse1):
-    """Reference log-sum-exp merge of the two halves' normalised outputs (fp32): ``[..., D]`` outputs, ``[...]``
-    LSEs; a half with ``lse = -inf`` (owns nothing) contributes nothing."""
-    m = torch.maximum(lse0, lse1)
-    w0 = torch.exp(lse0 - m)
-    w1 = torch.exp(lse1 - m)
-    return (w0.unsqueeze(-1) * out0 + w1.unsqueeze(-1) * out1) / (w0 + w1).unsqueeze(-1)
 
 
 # ── the half-block layout (served) ─────────────────────────────────────────────────────────────────────────────────

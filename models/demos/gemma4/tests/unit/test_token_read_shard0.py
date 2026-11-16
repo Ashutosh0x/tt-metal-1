@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""GEMMA4_TOKEN_READ_SHARD0 (item 3a of the gemma4_12b_qb2 port): the one-shard decode readback hands the host the
+"""GEMMA4_TOKEN_READ_SHARD0: the one-shard decode readback hands the host the
 same tokens and logits as the whole-mesh read, through the mixin's ``read_decode_output`` and the shared
 ``process_decode_output_host`` (blocking and event-based), and stays off where one shard is not the whole answer.
 

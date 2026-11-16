@@ -27,6 +27,10 @@ COLUMN_MESH_ENV = "GEMMA4_QB2_COLUMN_MESH"
 TP_AXIS_ENV = "GEMMA4_TP_AXIS"
 DISPATCH_ENV = "GEMMA4_MOE_DISPATCH_PREFILL"
 DISPATCH_MIN_TOKENS_ENV = "GEMMA4_MOE_DISPATCH_MIN_TOKENS"
+# the prefill pair of the dense set (DENSE_DECODE_FUSION_ON): the row-sharded residual (ccl.py) and the divisor
+# matmul slabs (dram_sharded.py)
+PREFILL_SEQ_PARALLEL_ENV = "GEMMA4_PREFILL_SEQ_PARALLEL"
+PREFILL_DIVISOR_SLAB_ENV = "GEMMA4_PREFILL_DIVISOR_SLAB"
 COLUMN_MESH_SHAPE = (4, 1)
 ROW_MESH_SHAPE = (1, 4)
 
@@ -153,8 +157,8 @@ DENSE_DECODE_FUSION_ON = {
     # GEMMA4_PREFILL_DIVISOR_SLAB); last-token logits bitwise unchanged on every arm. Eager 4K chunk at position 0 /
     # after an 8K prefix, both off -> on (2026-11-12, Galaxy, served env): 31B (1,8) 863 / 954 -> 690 / 780 ms, 12B
     # (1,8) 487 / 551 -> 396 / 440, 31B (1,4) 1213 / 1368 -> 1038 / 1200, 12B (1,4) 604 / 647 -> 503 / 544.
-    "GEMMA4_PREFILL_SEQ_PARALLEL": "1",
-    "GEMMA4_PREFILL_DIVISOR_SLAB": "1",
+    PREFILL_SEQ_PARALLEL_ENV: "1",
+    PREFILL_DIVISOR_SLAB_ENV: "1",
 }
 # GEMMA4_SDPA_DECODE_SPLITFREE: the split-independent paged decode SDPA (custom_ops/sdpa_decode_splitfree; "1" the
 # global layers, "2" the sliding layers too). Off in every profile until device-validated; a build turns it on by
@@ -196,8 +200,6 @@ DENSE_FUSED_SHAPES = FOUR_CHIP_SHAPES + (GALAXY_LINE_SHAPE,)
 # total 24,321 -> 28,154 tok/s, TPOT mean 50.6 -> 42.4 ms; needles 14/14 to 248K on every engine. Env overrides win.
 # The prefill pair GEMMA4_PREFILL_SEQ_PARALLEL / GEMMA4_PREFILL_DIVISOR_SLAB comes with the dense set
 # (DENSE_DECODE_FUSION_ON, measurements there).
-PREFILL_SEQ_PARALLEL_ENV = "GEMMA4_PREFILL_SEQ_PARALLEL"
-PREFILL_DIVISOR_SLAB_ENV = "GEMMA4_PREFILL_DIVISOR_SLAB"
 GALAXY_LINE_PAIR_ON = {**DENSE_DECODE_FUSION_ON, SDPA_PAIR_SPLIT_ENV: "1", VERIFY_PREFIX_LSE_ENV: "1"}
 # The Galaxy lane engine (the 26B-A4B on the (8,4) Blackhole mesh): the fused QKV norm + RoPE program on the lane
 # decode frame, the rest as before (the lane entry's catalog carries its own set). Window 13 (2026-10-25, lane layer

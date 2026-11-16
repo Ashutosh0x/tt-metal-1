@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""GEMMA4_SAMPLING_TRACE (item 3c of the gemma4_12b_qb2 port): the device sampler's replayed trace draws the same
+"""GEMMA4_SAMPLING_TRACE: the device sampler's replayed trace draws the same
 tokens as the eager sampler.
 
 Greedy over several steps of fresh logits (the force-argmax gather and the top-k form; #48037 corrupted from the

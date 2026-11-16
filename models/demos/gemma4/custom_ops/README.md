@@ -64,6 +64,7 @@ tests/unit/custom_ops/test_<op>.py
 | `moe_compute` | the shared decode MoE kernel's ComputeOnly program (tilize cores -> DRAM-ring matmul cores -> dm1 staging) with every expert's W0/W1 and W2 slice resident in L1 for the call (one DRAM stream per expert whatever the chunk count), `layer_id` a runtime arg, zero-score routes dropped by the tilize scan (`skip_zero_scores`, on by default; `GEMMA4_MOE_COMPUTE_SKIP_ZERO_SCORES=0` keeps them) | `tilize_input [1, T, H]` bf16 ROW_MAJOR, `indices / scores [1, T, K]` L1 HEIGHT_SHARDED on the tilize drain core (asserted), `mapping [D, E_global]` uint16, the shared op's packed bf4 weights -> its five ComputeOnly outputs; `staging_layout` `"standalone"` (one block per expert, the layout `selective_reduce_combine` reads) or `"fused"` (the shared op's halves, for the bit-identity test); `TTMoEDecodeCustom` (`moe_decode_custom.py`) runs `TTMoEDecode.forward` with the one `moe_compute` call redirected to this op + the standalone combine | `ttnn.experimental.moe_compute` on the decode frames (the per-chunk weight re-stream) |
 | `paged_update_rows` | the packed verify's K (or V) rows of every record row into the paged cache as one program: one (row, KV head) unit per core (`grid.plan_paged_update_rows`), per unit the <= 2 cache tile rows its P consecutive positions touch (through the ring modulo and the page table) as fixed jobs; per job the stock `paged_update_cache` read-modify-write (untilize the row's Wt tiles to bf16 row-major with the stock kernel_lib helper, patch the rows from the untilized source rows, tilize back in the cache format, store) by exactly one core, so no two cores touch one tile and the P rows go in one round trip (the stock's P sequential round trips are idempotent) | `src [1, nkv, S_pad, D]` bf16 TILE interleaved (the prefill-style K / V after norm and RoPE, row `b*P+p`), the loop's P `write_idxs [B]` int32 (-1 = skip), `page_table [B, blocks]` int32, the cache view (`num_kv_heads`, `block_size`), `cache_position_modulo`; a bf16 or bfp8 TILE DRAM cache updated in place; P <= 32, B <= 32; `unsupported_reason()` sends the rest to the loop | the per-position loop of `packed_decode_forward` (`packed_kv_write_loop`: slice, slice, reshard, reshard, update, update per position = 6 P programs per layer, 36 at K=5) -> 2 |
 | `sdpa_decode_lse` | the stock paged flash decode (`paged_scaled_dot_product_attention_decode`'s three kernels copied, the factory's core split, K-chunk split and binary-tree merge re-expressed in `planner.py`) whose tree root also exports its final row statistics: `m` (row max of the raw scores) and `l` (sum of `exp((s - m) * scale)`), so `lse = scale * m + ln(l)`; O is the stock op's, bit for bit by construction | `q [1, B, Hq <= 32, D in {256, 512}]` bf16 TILE interleaved, paged `k / v [blocks, nkv, block, D]` bf16 or bfp8 with the stock view (`num_kv_heads` 1, `block_size` a tile multiple), `page_table [B, max_blocks]` int32, `cur_pos [B]` int32 (-1 = skip), causal, no mask / sink / window, the stock `SDPAProgramConfig` (k chunk > 0) and compute config -> `(out [1, B, Hq, D] bf16, stats [1, B, PNH, 64] bf16)`, `stats[..., h, 0] = m`, `stats[..., h, 32] = l`; `unsupported_reason()` refuses the rest | the global layers' decode attention under the pair split (`tt/sdpa_pair_split.py`) and the prefix call of the serving verify (`tt/verify_prefix_lse.py`); `pair_split=True` attends one half of each row's key chunks per chip of a KV-head pair |
+| `sdpa_prefill_splitk` | causal chunked prefill SDPA whose every (Q head, Q chunk) unit's K range is split into pieces spread over all cores (`plan_pieces`: longest first, per-core lists padded to a compile-time slot count so a program-cache hit keeps the runtime-arg count); each piece writes its normalised O and (m, l); a second program merges the pieces by log-sum-exp in fp32 (`merge`, optionally exporting the merged (M, L) so a result can be merged again) | `q [1, NQH, Sq, D]` bf16 TILE interleaved, paged `k / v` bf16 or bfp8 with the stock view, `page_table [1, max_blocks]` int32 covering the keys read, a host `chunk_start` (causal, `q_chunk == k_chunk` unless unsplit) or `k_chunks` (non-causal); `pays()` keeps the stock op where its pair schedule already fills the chip; `unsupported_reason()` refuses the rest | `chunked_scaled_dot_product_attention` on the global layers' later prefill chunks (`GEMMA4_PREFILL_SDPA_SPLITK`, from a 16K prefix) and the pair-sharded prefill's three-way merge (`GEMMA4_KV_PAIR_SHARD`) |
 
 ## Defaults per build
 
@@ -131,8 +132,20 @@ split-independent decode SDPA of the `arg/gemma4_sdpa_splitfree` branch where en
 At long context a global layer's decode attention is DRAM-bound (about 370 GB/s; 1.57 ms per layer at 4 users x
 131K on one Blackhole chip). The two chips that hold the same KV head can each attend half of a row's keys and
 merge: `O = (e^(lse_a - M) O_a + e^(lse_b - M) O_b) / (e^(lse_a - M) + e^(lse_b - M))`, `M = max(lse_a, lse_b)`,
-halving each chip's bytes. Chip B's half is the same call through the page table shifted by `mid / block` blocks
-with `cur_pos - mid` (`mid` a block multiple); a row shorter than `mid` skips chip B (`cur_pos -1`, weight 0).
+halving each chip's bytes. The halves are split inside the kernels, per chip of a pair:
+
+* `pair_split=True` (`GEMMA4_SDPA_PAIR_SPLIT`): chip `c` attends the row's key chunks of parity `c % 2`
+  (`planner.pair_workload_for_core`, `kernels/pair_split.hpp`), every chip holding the whole KV sequence; a row with
+  no chunk of a chip's parity writes the finite empty-half statistics (O 0, `m` -30000, `l` 1: merge weight ~0), so
+  no host masking is needed.
+* `half_block=True` (`GEMMA4_KV_PAIR_SHARD`): each chip holds only its half of every 128-token logical block (two
+  64-token device pages, chip `c` the page `c % 2`), so the chunk is the device page and the row's `cur_pos` is
+  mapped onto the chip's own pages (`kv_pair_shard.half_block_cur_pos`); the read table is the logical table at the
+  device page.
+* `owned` (test-only planner, `tests/unit/custom_ops/test_sdpa_decode_lse.py`): block-parity ownership through
+  per-chip read tables, which needs a vLLM allocator change to serve.
+
+A `cur_pos -1` row is skipped and its output left unwritten: the caller masks it.
 
 * **Kernels**: `kernels/{reader,writer}_decode_lse.cpp` and `sdpa_flash_decode_lse.cpp` are copies of the stock
   `reader_decode_all.cpp`, `writer_decode_all.cpp` and `sdpa_flash_decode.cpp` (tt-metal 298c06426a8); every edit is
@@ -150,9 +163,12 @@ with `cur_pos - mid` (`mid` a block multiple); a row shorter than `mid` skips ch
   0`), sub-tile blocks, the speculative multi-position mode. Only the active cores carry the program, and the
   tree-merge staging CB holds one block per round instead of `cores_per_head - 1` (same values).
 * **Tests**: host `tests/unit/test_custom_op_planners_host.py -k sdpa_decode_lse` (the tree against a flat
-  merge for every group size <= 64, the factory's split, argument layouts, the L1 fit); device
+  merge for every group size <= 64, the factory's split, argument layouts, the L1 fit) and
+  `tests/unit/test_pair_split_host.py` (the pair layouts, selector and merge against torch); device
   `GEMMA4_SDPA_LSE_TEST=1 pytest tests/unit/custom_ops/test_sdpa_decode_lse.py` (O bitwise against the stock op,
-  PCC and LSE against torch, the two-half merge against one full call, the cache repeat, the refusals).
+  PCC and LSE against torch, the two-half merge against one full call, the cache repeat, the refusals, the owned and
+  half-block modes, the pair split and the model's device pair merge on a 2-chip row, and `sdpa_prefill_splitk`
+  against torch and the stock op: plan coverage, the merged LSE, a program-cache hit at a second chunk start).
 
 ## Kernel traps (Blackhole, `ttnn.generic_op`)
 

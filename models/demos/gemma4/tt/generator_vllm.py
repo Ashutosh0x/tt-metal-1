@@ -950,7 +950,7 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
         self._decode_warmup_complete = True
         if any(self._g4_sampling_trace_on(i) for i in range(len(self.model))):
             # the sweep's lazily captured sampling traces (one per bucket and plain key) are this generator's, not
-            # strays: every decode key re-takes its allocation baseline at its next replay
+            # strays: the baseline starts over at the level after them (retaken below for every captured key)
             self._g4_trace_alloc_baseline = {}
         # Baseline for the decode-trace allocation guard: the level right after the captures, before
         # any request can leave a persistent allocation in the traces' scratch range.
@@ -3446,8 +3446,15 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
         before any decode trace is captured (``attention.prefill.pair_split_warm_swaps``); once."""
         if not kv_pair_shard_enabled() or getattr(self, "_g4_pair_swaps_warmed", False):
             return
-        from models.demos.gemma4.tt.attention.prefill import pair_split_warm_swaps
+        from models.demos.gemma4.tt.attention.prefill import PAIR_SPLIT_ROWS, pair_split_warm_swaps
 
+        chunk = int(self.model_args[0].max_prefill_chunk_size)
+        if chunk > PAIR_SPLIT_ROWS:
+            # a later chunk past the swap's rows would fail every long prompt at request time
+            raise ValueError(
+                f"{KV_PAIR_SHARD_ENV}=1: max_prefill_chunk_size {chunk} > the pair-split swap's {PAIR_SPLIT_ROWS} rows "
+                "(GEMMA4_GEN_PREFILL_CHUNK)"
+            )
         layers = self.model[0].layers
         caches = kv_cache
         if caches and len(caches) != len(layers) and isinstance(caches[0], (list, tuple)):

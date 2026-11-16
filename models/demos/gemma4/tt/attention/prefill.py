@@ -1100,11 +1100,17 @@ def _pair_swap(mine):
 
 def _pair_swap_rows(t, rows=PAIR_SPLIT_ROWS):
     """``t`` ``[1, H, S, W]`` swapped within every chip pair through a ``[1, H, rows, W]`` buffer: one
-    ``point_to_point`` workload per (H, W, dtype), whatever the chunk length (``pair_split_warm_swaps``)."""
+    ``point_to_point`` workload per (H, W, dtype), whatever the chunk length (``pair_split_warm_swaps``). The buffer
+    is DRAM interleaved, the warmed layout, whatever ``t``'s memory config: another layout is another workload."""
     _, h, n, w = (int(v) for v in t.shape)
     if n > rows:
         raise ValueError(f"{KV_PAIR_SHARD_ENV}: a {n}-row chunk past the {rows}-row pair swap")
-    padded = ttnn.pad(t, [(0, 0), (0, 0), (0, rows - n), (0, 0)], value=0.0) if n < rows else t
+    if n < rows:
+        padded = ttnn.pad(t, [(0, 0), (0, 0), (0, rows - n), (0, 0)], value=0.0, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    elif t.memory_config() != ttnn.DRAM_MEMORY_CONFIG:
+        padded = ttnn.to_memory_config(t, ttnn.DRAM_MEMORY_CONFIG)
+    else:
+        padded = t
     theirs = _pair_swap(padded)
     if padded is not t:
         padded.deallocate(True)
@@ -1381,8 +1387,15 @@ def _prefill_forward_single(
         if chunk_offset is None:
             raise ValueError(f"{KV_PAIR_SHARD_ENV}: the traced multi-chunk prefill is not supported")
         _bs = effective_block_size(kv_cache[0], config.head_dim, 1)
+        _n = int(hidden_states.shape[-2])
+        # the pair split's own checks (a later chunk), before the fill writes anything: whole logical blocks (two
+        # device pages) and the fresh-chunk SDPA's 128-row Q chunks
+        if chunk_offset % (2 * _bs) or (chunk_offset > 0 and (_n % _bs or _n % 128)):
+            raise ValueError(
+                f"{KV_PAIR_SHARD_ENV}: chunk at {chunk_offset} (+{_n} rows) off the {2 * _bs}-token blocks"
+            )
         _c0 = chunk_offset // _bs
-        _cols = max(1, -(-int(hidden_states.shape[-2]) // _bs))
+        _cols = max(1, -(-_n // _bs))
         _hb_cut = (
             continuation.half_block_fill_table(
                 _c0, _cols, valid_cols=(-(-_valid_cols // _bs) if _valid_cols is not None else None)

@@ -6,8 +6,8 @@ several cores and merged by log-sum-exp.
 
 Why: the stock op runs one (Q head, 128-row Q chunk) unit per core, each walking the whole prefix, and hands causal
 units out in pairs. A served 4096-row chunk of the 31B (4 local Q heads) is 128 units = 64 pairs, so 64 of a
-Blackhole chip's 120 cores each walk the prefix twice (probes/sdpa_qlen_bench.py, 2026-11-13: 50.9 ms after a 64K
-prefix, the same as 3840 rows). Splitting every unit's K range into ``splits`` pieces gives ``128 * splits`` pieces
+Blackhole chip's 120 cores each walk the prefix twice (one Galaxy chip, 2026-11-13: 50.8 ms after a 64K prefix,
+the same as 3840 rows; ``pays`` has the split's time). Splitting every unit's K range into ``splits`` pieces gives ``128 * splits`` pieces
 that the planner spreads over all cores (longest piece first), each a fraction of the walk.
 
 One ``ttnn.generic_op`` program (``kernels/``): per core a list of pieces (head, Q chunk, K chunks [k_lo, k_hi),
@@ -25,7 +25,8 @@ Contract (``unsupported_reason`` refuses the rest; the caller keeps the stock op
 interleaved, ``Sq`` a multiple of ``q_chunk_size``; ``k_cache / v_cache`` paged TILE interleaved (bf16 or bfloat8_b)
 with the layer's own geometry (``num_kv_heads``, ``block_size``: the stock ``PagedCacheGeometryOverride`` view);
 ``page_table [1, max_blocks]`` int32 ROW_MAJOR; ``chunk_start`` a host int, a multiple of both chunk sizes and at
-least ``splits`` K chunks so every piece holds keys; causal; ``q_chunk_size == k_chunk_size``.
+least ``splits`` K chunks so every piece holds keys; causal ``q_chunk_size == k_chunk_size`` (a larger q chunk
+only unsplit, ``splits=1``) or non-causal over ``k_chunks``; a page table covering the keys the call reads.
 """
 
 import functools
@@ -178,15 +179,24 @@ class SdpaPrefillSplitK:
     ):
         if q.dtype != ttnn.bfloat16 or q.layout != ttnn.TILE_LAYOUT or q.is_sharded():
             return "q must be bf16 TILE interleaved"
-        if k_cache.dtype not in _DTYPE_NAME or v_cache.dtype != k_cache.dtype:
-            return f"cache dtype {k_cache.dtype}"
+        for name, t in (("k", k_cache), ("v", v_cache)):
+            if t.dtype not in (ttnn.bfloat16, ttnn.bfloat8_b) or t.layout != ttnn.TILE_LAYOUT or t.is_sharded():
+                return f"{name} cache must be a bf16 or bfloat8_b TILE interleaved tensor"
+        if v_cache.dtype != k_cache.dtype or tuple(k_cache.shape) != tuple(v_cache.shape):
+            return "k and v caches must share dtype and shape"
         if q_chunk_size % TILE or k_chunk_size % TILE or (causal and q_chunk_size % k_chunk_size):
             return f"chunk sizes q {q_chunk_size} / k {k_chunk_size} (tile multiples; causal: k divides q)"
+        if causal and q_chunk_size != k_chunk_size and splits != 1:
+            # a split piece holding only a Q chunk's last K chunk leaves that chunk's first rows no visible key (NaN)
+            return f"causal q chunk {q_chunk_size} > k chunk {k_chunk_size} only unsplit (splits=1), got {splits}"
         b, nqh, sq, d = (int(v) for v in q.shape)
         if b != 1 or sq % q_chunk_size or d % TILE:
             return f"q shape {(b, nqh, sq, d)}"
         if nqh % int(num_kv_heads):
             return "q heads not a multiple of kv heads"
+        _, kh, ks, kd = (int(v) for v in k_cache.shape)
+        if kh * ks * kd != int(num_kv_heads) * int(block_size) * d:
+            return f"cache view mismatch: cache {kh}x{ks}x{kd} elements per block, view {num_kv_heads}x{block_size}x{d}"
         if causal:
             if chunk_start % k_chunk_size or chunk_start % q_chunk_size:
                 return f"chunk_start {chunk_start} not a multiple of the chunk sizes"
@@ -202,6 +212,10 @@ class SdpaPrefillSplitK:
             or int(page_table.shape[0]) != 1
         ):
             return "page table must be [1, max_blocks] int32 ROW_MAJOR"
+        max_blocks = int(page_table.shape[1])
+        keys = chunk_start + sq if causal else int(k_chunks) * k_chunk_size
+        if max_blocks * int(block_size) < keys:
+            return f"page table covers {max_blocks * int(block_size)} keys, the call reads {keys}"
         _, total = _cb_plan(
             "bfloat16",
             _DTYPE_NAME[k_cache.dtype],
