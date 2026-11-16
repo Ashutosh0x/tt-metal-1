@@ -63,6 +63,9 @@
 
 #ifdef ENABLE_PREFETCHER_PIPE
 #include "ttnn/operations/matmul/device/kernels/dataflow/prefetcher_pipe_in1_window.hpp"
+#ifdef ARCH_QUASAR
+#error "PrefetcherPipe weight delivery into this matmul has not been brought up on Quasar"
+#endif
 #endif
 
 // Reads one in1 block (BLOCK_H x BLOCK_W tiles, of which the first block_w_to_read per row exist) from an
