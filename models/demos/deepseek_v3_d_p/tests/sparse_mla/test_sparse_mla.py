@@ -1323,6 +1323,13 @@ SPARSE_SP1_MESH_CASES = [
         marks=pytest.mark.requires_mesh_topology(mesh_shape=(4, 4), topology="mesh-4x4"),
         id="glm_5_3-shape-4x4-sp1",
     ),
+    pytest.param(
+        "glm_5_3",
+        (4, 4),
+        torus_xy_device_params(worker_l1_size=_worker_l1_size()),
+        marks=pytest.mark.requires_mesh_topology(mesh_shape=(4, 4), topology="mesh-4x4"),
+        id="glm_5_3-shape-xy4-sp1",
+    ),
 ]
 
 
