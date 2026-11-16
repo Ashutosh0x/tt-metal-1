@@ -9,6 +9,11 @@
 # - The image is the public python:3.10-bookworm image pinned by digest, not
 #   llk-ci (the ci-build chain image does not import on prod today); the
 #   Python requirements go into a venv at job time, as llk-ci bakes them in.
+# - Setup uses uv (faster than pip) and installs the same package set pip
+#   resolves, with pip and setuptools pinned to the pip-built venv's versions.
+#   --index-strategy unsafe-best-match is needed because uv's default takes a
+#   package from the first index that has it, which would skip the newer
+#   versions pip picks from the extra indexes in requirements.txt.
 # - The JUnit reports are not published (artifact storage is tight).
 # No triggers: run it by hand.
 jobs:
@@ -32,11 +37,12 @@ jobs:
           run:
             - mkdir -p "$HOME"
             - python3 --version
-            - python3 -m venv /tmp/venv
-            - /tmp/venv/bin/pip install -q -r tt_metal/tt-llk/tests/requirements.txt
-            - . /tmp/venv/bin/activate && cd tt_metal/tt-llk/tests && ./setup_testing_env.sh
+            - python3 -m pip install -q uv
+            - python3 -m uv venv /tmp/venv --python python3
+            - python3 -m uv pip install --python /tmp/venv/bin/python --index-strategy unsafe-best-match -r tt_metal/tt-llk/tests/requirements.txt pip==23.0.1 setuptools==79.0.1
+            - PATH=/tmp/venv/bin:$PATH VIRTUAL_ENV=/tmp/venv; export PATH VIRTUAL_ENV; cd tt_metal/tt-llk/tests && ./setup_testing_env.sh
       - id: hardware-free
         kind: shell
         shell:
           run:
-            - . /tmp/venv/bin/activate && cd tt_metal/tt-llk && ./tests/run_hardware_free.sh
+            - PATH=/tmp/venv/bin:$PATH VIRTUAL_ENV=/tmp/venv; export PATH VIRTUAL_ENV; cd tt_metal/tt-llk && ./tests/run_hardware_free.sh
