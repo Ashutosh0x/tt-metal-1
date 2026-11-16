@@ -975,6 +975,64 @@ def _recompute_vision_rows_paged(
     return merged
 
 
+def _recompute_vision_rows_pair(
+    q_tiles, tt_out, k_cache, v_cache, page_table, user_id, config, weights, mesh_config, ccl_manager, mesh_device
+):
+    """``GEMMA4_KV_PAIR_SHARD``: ``_recompute_vision_rows_paged`` on a pair-sharded global layer's pair view. Each
+    tile of rows holding image rows attends ``[0, cur_pos]`` per row (the image span past the row included) through
+    the decode pair split (``attention.decode.pair_split_sdpa``: ``SdpaDecodeLse(half_block=True)`` over this chip's
+    half of every block, merged with the partner by LSE), whose result is this chip's share like the rest of
+    ``tt_out`` (``pair_split_prefill_attention``); it is written over the causal rows. ``q_tiles`` from
+    ``_vision_q_tiles`` on the pair view's queries (the q heads of the chip's KV group)."""
+    from models.demos.gemma4.tt.attention.decode import _sdpa_max_cores_per_head_kwargs, pair_split_sdpa
+
+    nqh, head_dim = int(tt_out.shape[1]), int(tt_out.shape[-1])
+    rows = int(tt_out.shape[-2])
+    device_grid = mesh_device.compute_with_storage_grid_size()
+    program_config = ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(device_grid.x, device_grid.y),
+        q_chunk_size=32,
+        k_chunk_size=int(os.environ.get("GEMMA4_SDPA_DECODE_K_CHUNK", "64")),
+        exp_approx_mode=False,
+        **_sdpa_max_cores_per_head_kwargs(),
+    )
+    mapper = ttnn.ReplicateTensorToMesh(mesh_device)
+    # the user's table row, one copy per row of a tile (one decode batch entry per row); a slice may be a view of
+    # the caller's table, so only the repeat is freed
+    table_row = ttnn.slice(page_table, [int(user_id), 0], [int(user_id) + 1, int(page_table.shape[-1])])
+    table_rows = ttnn.repeat(table_row, ttnn.Shape([TILE_ROWS, 1]))
+    pieces, cursor = [], 0
+    for r0, r1, cur_pos, q_dec in q_tiles:
+        n = r1 - r0
+        if r0 > cursor:
+            pieces.append(ttnn.slice(tt_out, [0, 0, cursor, 0], [1, nqh, r0, head_dim]))
+        positions = list(cur_pos) + [cur_pos[-1]] * (TILE_ROWS - n)  # padded rows: any valid position
+        pos = ttnn.from_torch(
+            torch.tensor(positions, dtype=torch.int32), device=mesh_device, dtype=ttnn.int32, mesh_mapper=mapper
+        )
+        share = pair_split_sdpa(
+            q_dec, k_cache, v_cache, pos, table_rows, config, weights, program_config, mesh_config, ccl_manager
+        )
+        q_dec.deallocate(True)
+        pos.deallocate(True)
+        out_rm = ttnn.to_layout(share, ttnn.ROW_MAJOR_LAYOUT)  # [1, 32, heads (padded), hd]
+        heads = ttnn.slice(out_rm, [0, 0, 0, 0], [1, TILE_ROWS, nqh, head_dim])
+        perm = ttnn.permute(heads, (0, 2, 1, 3))  # [1, nqh, 32, hd]
+        tile_out = ttnn.to_layout(perm, ttnn.TILE_LAYOUT)
+        if n < TILE_ROWS:
+            tile_out = ttnn.slice(tile_out, [0, 0, 0, 0], [1, nqh, n, head_dim])
+        pieces.append(tile_out)
+        cursor = r1
+    if cursor < rows:
+        pieces.append(ttnn.slice(tt_out, [0, 0, cursor, 0], [1, nqh, rows, head_dim]))
+    table_rows.deallocate(True)
+    if len(pieces) == 1:
+        return pieces[0]
+    merged = ttnn.concat(pieces, dim=2)
+    tt_out.deallocate(True)  # the causal shares; their slices in ``pieces`` go with it
+    return merged
+
+
 def _sdpa_single_chunk(tt_q, tt_k, tt_v, config, seq_len, sliding_window, compute_kernel_config, mm_attn_mask=None):
     """Single-chunk prefill SDPA. With ``mm_attn_mask`` (image-span bidirectional mask, see
     ``build_mm_prefill_masks`` above) the op takes the explicit additive mask instead of ``is_causal`` and
@@ -1979,8 +2037,6 @@ def _prefill_forward_single(
             # merges per-half attention by LSE instead of moving them (pair_split_prefill_attention)
             if chunk_offset is None or not isinstance(chunk_offset, int):
                 raise ValueError(f"{KV_PAIR_SHARD_ENV}: the traced multi-chunk prefill is not supported")
-            if q_tiles:
-                raise ValueError(f"{KV_PAIR_SHARD_ENV}: image rows over a pair-sharded prefix are not supported")
             tt_sdpa = pair_split_prefill_attention(
                 tt_q,
                 tt_k,
@@ -1996,6 +2052,21 @@ def _prefill_forward_single(
                 mesh_config,
                 ccl_manager,
             )
+            if q_tiles:
+                # image rows: their bidirectional span on top of the causal prefix, on the pair view
+                tt_sdpa = _recompute_vision_rows_pair(
+                    q_tiles,
+                    tt_sdpa,
+                    k_cache,
+                    v_cache,
+                    page_table,
+                    user_id,
+                    config,
+                    weights,
+                    mesh_config,
+                    ccl_manager,
+                    q_device,
+                )
         else:
             tt_sdpa = chunked_prefill_sdpa(
                 tt_q,
