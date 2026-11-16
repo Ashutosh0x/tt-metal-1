@@ -418,9 +418,10 @@ class UnregisteredModule:
         return self.module(*args, **kwargs)
 
 
-# The tracers capturing right now. A trace bakes in the addresses of the weights it reads, so each
-# parameter read during a capture remembers the tracer, and tells it when those weights go away.
-_capturing_tracers: list[Any] = []
+# The tracer capturing right now, if any. A trace bakes in the addresses of the weights it reads, so
+# each parameter read during a capture remembers the tracer, and tells it when those weights go away.
+# One slot: a capture that starts during another one, nested or concurrent, is not supported.
+_capturing_tracer: Any | None = None
 
 
 class Parameter:
@@ -518,9 +519,8 @@ class Parameter:
         if self._data is None:
             msg = "parameter has no data"
             raise RuntimeError(msg)
-        if _capturing_tracers:
-            for tracer in _capturing_tracers:
-                tracer.watch(self)
+        if _capturing_tracer is not None:
+            _capturing_tracer.watch(self)
         return self._data
 
     @data.setter
