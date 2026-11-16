@@ -1036,7 +1036,6 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
         # (trace) pass (see the method).
         if getattr(self, "_decode_warmup_complete", False):
             self._g4_warmup_lane_prefill_group(kv_cache)
-        self._g4_warm_pair_shard_swaps(kv_cache)
         warmup_gemma4_model_prefill(
             self,
             kv_cache,
@@ -3440,36 +3439,6 @@ class Gemma4ForCausalLM(ChunkedPrefillPageTableGuardMixin, HybridAttentionForCau
                 submesh_kv[layer_idx] = submesh_kv[source_idx]
         self._attach_sdpa_splitfree_scratch(kv_cache)
         return kv_cache
-
-    def _g4_warm_pair_shard_swaps(self, kv_cache):
-        """GEMMA4_KV_PAIR_SHARD: create the pair-split prefill's point_to_point workloads (its fixed swap shapes)
-        before any decode trace is captured (``attention.prefill.pair_split_warm_swaps``); once."""
-        if not kv_pair_shard_enabled() or getattr(self, "_g4_pair_swaps_warmed", False):
-            return
-        from models.demos.gemma4.tt.attention.prefill import PAIR_SPLIT_ROWS, pair_split_warm_swaps
-
-        chunk = int(self.model_args[0].max_prefill_chunk_size)
-        if chunk > PAIR_SPLIT_ROWS:
-            # a later chunk past the swap's rows would fail every long prompt at request time
-            raise ValueError(
-                f"{KV_PAIR_SHARD_ENV}=1: max_prefill_chunk_size {chunk} > the pair-split swap's {PAIR_SPLIT_ROWS} rows "
-                "(GEMMA4_GEN_PREFILL_CHUNK)"
-            )
-        layers = self.model[0].layers
-        caches = kv_cache
-        if caches and len(caches) != len(layers) and isinstance(caches[0], (list, tuple)):
-            caches = caches[0]  # the plugin nests the caches per submesh
-        idx = min(self.model[0]._kv_pair_shard_layers)
-        mesh_device = caches[idx][0].device()
-        cfg = layers[idx].self_attn.config
-        num_heads = int(cfg.num_attention_heads) // int(mesh_device.shape[1])
-        t0 = time.perf_counter()
-        n = pair_split_warm_swaps(mesh_device, num_heads, int(cfg.head_dim))
-        self._g4_pair_swaps_warmed = True
-        logger.info(
-            f"{KV_PAIR_SHARD_ENV}: warmed {n} pair-split swap workloads ({num_heads} heads) in "
-            f"{time.perf_counter() - t0:.1f} s, before the decode-trace capture"
-        )
 
     def _ensure_page_tables_per_layer(self, page_tables_per_layer, page_table):
         """Broadcast legacy ``page_table`` to per-layer whenever the plugin

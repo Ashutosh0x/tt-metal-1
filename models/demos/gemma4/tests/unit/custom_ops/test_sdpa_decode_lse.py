@@ -44,6 +44,7 @@ import ttnn
 from models.demos.gemma4.custom_ops.sdpa_decode_lse import SdpaDecodeLse
 from models.demos.gemma4.custom_ops.sdpa_decode_lse import planner as P
 from models.demos.gemma4.custom_ops.sdpa_prefill_splitk.op import SdpaPrefillSplitK
+from models.demos.gemma4.tt.attention.prefill import _lse_column, pair_prefill_contribution
 
 SINGLE_CHIP = [pytest.param(1, {"fabric_config": ttnn.FabricConfig.DISABLED}, id="single-chip")]
 # the pair: one (1, 2) mesh, fabric as test_factory.parametrize_mesh_with_fabric opens multi-chip meshes (the op
@@ -563,7 +564,9 @@ def test_sdpa_decode_lse_pair_merge_matches_full(mesh_device, device_params, B, 
             s = s.masked_fill(~visible, float("-inf"))
             return torch.softmax(s, dim=-1) @ values
 
-        # the pair split: both halves' prefix results + the chunk's own keys (causal, splits 1) merged three ways
+        # the pair split: both halves' prefix results + the chunk's own keys (causal, splits 1); each chip's share of
+        # the three-way merge (attention.prefill.pair_prefill_contribution: its half, the partner's by LSE only, half of
+        # the chunk term), summed as the pair o_proj's row all-reduce sums them
         fresh_k = torch.randn(1, 1, 128, D).to(torch.bfloat16)
         fresh_v = torch.randn(1, 1, 128, D).to(torch.bfloat16)
         put = dict(device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, **case.rep)
@@ -584,8 +587,18 @@ def test_sdpa_decode_lse_pair_merge_matches_full(mesh_device, device_params, B, 
             merge=False,
         )
         (o_0, st_0), (o_1, st_1) = pf_halves
-        o_all, st_all = ttnn.concat([o_0, o_1, o_c], dim=1), ttnn.concat([st_0, st_1, st_c], dim=1)
-        split_out = case.host(SdpaPrefillSplitK.merge(o_all, st_all, 3, Hq))[0].float()
+        lses = [_lse_column(t) for t in (st_0, st_1, st_c)]
+        split_out = 0
+        for own, other in ((0, 1), (1, 0)):
+            share = pair_prefill_contribution(
+                ttnn.clone((o_0, o_1)[own]),
+                ttnn.clone(lses[own]),
+                ttnn.clone(lses[other]),
+                ttnn.clone(o_c),
+                ttnn.clone(lses[2]),
+            )
+            split_out = split_out + case.host(share)[0].float()
+            share.deallocate(True)
         keys = torch.cat([k_pre, fresh_k[0, 0].float()])
         values = torch.cat([v_pre, fresh_v[0, 0].float()])
         visible = torch.cat([torch.ones(128, prefix, dtype=torch.bool), torch.ones(128, 128).tril().bool()], dim=1)
@@ -631,7 +644,7 @@ def test_sdpa_decode_lse_pair_merge_matches_full(mesh_device, device_params, B, 
         assert pcc_ps >= PAIR_PCC_MIN, f"pair-split prefill vs torch pcc {pcc_ps:.6f}"
         assert pcc_sk >= PCC_MIN and pcc_sk >= pcc_stock - 1e-4, f"split-K {pcc_sk:.6f} vs stock {pcc_stock:.6f}"
         _check_splitk_served_shape(mesh_device, case, row, int(cur_pos[row]) + 1, Hq, pf_ckc)
-        for t in (o_0, st_0, o_1, st_1, o_c, st_c, o_all, st_all, fk, fv, ident, tt_full_row, served):
+        for t in (o_0, st_0, o_1, st_1, o_c, st_c, *lses, fk, fv, ident, tt_full_row, served):
             t.deallocate(True)
     pf_tt_q.deallocate(True)
 

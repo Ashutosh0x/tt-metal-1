@@ -17,9 +17,9 @@ slot the logical page table names: one page table for both chips, the global KV 
 * writes (stock ``paged_fill_cache`` / ``paged_update_cache`` / ``paged_fused_update_cache``): a per-chip WRITE
   table at the device page's granularity, column ``2 i + h`` = logical block ``i``'s slot on its owner and the
   vLLM null block 0 elsewhere (``half_block_write_tables``), so a chip writes only its own half;
-* prefill attention over cached keys: each chip attends its own half of every block (the logical table at the
-  device page) and the pair merges the per-half results by log-sum-exp
-  (``attention.prefill.pair_split_prefill_attention``).
+* prefill attention over cached keys: on the layer's pair view (the q heads of the chip's whole KV group) each chip
+  attends its own half of every block (the logical table at the device page) and the chunk's own keys, and the pair
+  merges by log-sum-exp, exchanging one LSE per head and row (``attention.prefill.pair_split_prefill_attention``).
 
 The block-parity layout (ownership by block id, compacted read tables) is not served: it needs a vLLM allocator
 change. The ``owned`` mode of ``custom_ops/sdpa_decode_lse`` that would read it is tested with its own read-table
