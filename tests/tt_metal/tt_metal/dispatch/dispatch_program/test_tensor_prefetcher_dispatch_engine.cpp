@@ -4,7 +4,6 @@
 
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -75,11 +74,16 @@ struct DispatchEngineRegion {
 
     uint32_t read(uint32_t offset) const { return read_word(mesh_device, core, base + offset); }
 
-    // Slots every Tensor prefetcher kernel has retired.
+    // Slots every Tensor prefetcher kernel has retired. The counts are ordered as the host orders them. Fast
+    // dispatch zeroes them at launch, so they cannot wrap here; the static_asserts on fifo::count_behind cover
+    // the wrap.
     uint32_t slots_retired_by_every_kernel() const {
         uint32_t retired = read(fifo::fifo_rd_offset(0));
         for (uint32_t k = 1; k < tensor_prefetcher_kernels().size(); ++k) {
-            retired = std::min(retired, read(fifo::fifo_rd_offset(k)));
+            const uint32_t kernel_rd = read(fifo::fifo_rd_offset(k));
+            if (fifo::count_behind(kernel_rd, retired)) {
+                retired = kernel_rd;
+            }
         }
         return retired;
     }
@@ -88,7 +92,7 @@ struct DispatchEngineRegion {
     uint32_t wait_for_retired(uint32_t target) const {
         const auto deadline = std::chrono::steady_clock::now() + kRetireTimeout;
         uint32_t retired = slots_retired_by_every_kernel();
-        while (retired < target && std::chrono::steady_clock::now() < deadline) {
+        while (fifo::count_behind(retired, target) && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(kPollInterval);
             retired = slots_retired_by_every_kernel();
         }
@@ -99,7 +103,7 @@ struct DispatchEngineRegion {
     uint32_t wait_for_written(uint32_t target) const {
         const auto deadline = std::chrono::steady_clock::now() + kRetireTimeout;
         uint32_t written = read(fifo::kFifoWrOffset);
-        while (written < target && std::chrono::steady_clock::now() < deadline) {
+        while (fifo::count_behind(written, target) && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(kPollInterval);
             written = read(fifo::kFifoWrOffset);
         }

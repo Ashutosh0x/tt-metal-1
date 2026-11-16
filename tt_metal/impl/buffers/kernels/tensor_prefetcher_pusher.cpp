@@ -88,6 +88,7 @@ bool push_tensor(
     WAYPOINT("TPPW");
     while (remaining > 0) {
         uint32_t writing = 0;
+        bool waiting_on_receiver = false;
         for (uint32_t i = 0; i < stream.num_receivers; ++i) {
             if (blocks_pushed[i] == blocks || *region.staged(i) == pushed[i]) {
                 continue;
@@ -95,6 +96,7 @@ bool push_tensor(
             PrefetcherPipe& pipe = pipes[stream.lane[i]];
             const uint32_t r = stream.receiver_in_lane[i];
             if (!pipe.receiver_has_space(r, 1)) {
+                waiting_on_receiver = true;
                 continue;
             }
             const CoreLocalMem<uint8_t> block(stream.stage_slot_addr(i, pushed[i] % fifo::kStageSlotsPerReceiver));
@@ -102,13 +104,21 @@ bool push_tensor(
             writing |= 1u << i;
         }
         if (writing == 0) {
+            // Nothing to send. The waypoint says whether a staged block waits for its receiver to free ring
+            // space (TPPC) or every unfinished receiver waits for the reader to stage its next block (TPPR).
+            if (waiting_on_receiver) {
+                WAYPOINT("TPPC");
+            } else {
+                WAYPOINT("TPPR");
+            }
             if (requests.terminate_requested()) {
                 return false;
             }
             continue;
         }
+        WAYPOINT("TPPW");
         // The blocks must land before the credits that advertise them, and before the reader may reuse
-        // their stage slots. The flush covers every pipe's writes on this NoC.
+        // their stage slots. Every lane's writes went out on `noc`, so one flush covers them all.
         pipes[0].flush_writes(noc);
         for (uint32_t i = 0; i < stream.num_receivers; ++i) {
             if (writing & (1u << i)) {
