@@ -97,7 +97,6 @@ DB_SCHEMA = [
     Column("ct_dim", "int64", True, "configuration"),
     Column("csa_row_offset", "int64", True, "configuration"),
     Column("dest_sync", "string", True, "configuration"),
-    Column("disable_src_zero_flag", "bool", True, "configuration"),
     Column("enable_direct_indexing", "bool", True, "configuration"),
     Column("dst_index", "int64", True, "configuration"),
     Column("dst_rounding", "string", True, "configuration"),
