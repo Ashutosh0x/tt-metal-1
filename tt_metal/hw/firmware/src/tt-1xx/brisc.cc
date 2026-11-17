@@ -21,6 +21,7 @@
 #include "api/debug/kernel_profiler.hpp"
 #include "internal/profiler/perf_counters.hpp"
 #include "internal/profiler/riscv_pmc.hpp"
+#include "internal/profiler/noc_counters.hpp"
 #include "hostdev/dev_msgs.h"
 #include "hostdev/l1_ecc_halt_constants.h"
 #include "internal/risc_attribs.h"
@@ -626,6 +627,8 @@ int main() {
                     (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg_address->kernel_config.local_cb_offset);
                 // Before either data movement kernel can issue on a NOC.
                 CLEAR_NOC_CMD_BUF_USAGE_FOR_WATCHER();
+                // The NIU counters are per tile: the window spans every core of the launch.
+                NocCountersBegin();
                 start_ncrisc_kernel_run_early(enables);
 
                 // Run the BRISC kernel
@@ -688,6 +691,7 @@ int main() {
                 RiscvPmcEnd();
 
                 wait_ncrisc_trisc();
+                NocCountersEnd();
 
                 // BRISC stops and reads perf counters after TRISCs finish (BRISC has NOC access for DRAM push).
                 StopPerfCounters();
