@@ -85,8 +85,8 @@ inline std::string get_generic_reduction_doc(
             The output tensor will be in TILE layout and have the same dtype as the :attr:`input_tensor`.
             Exception: 4D ROW_MAJOR BFLOAT16/FLOAT32 inputs with INTERLEAVED memory config reduced along
             the last (-1) or second-to-last (-2) dimension preserve ROW_MAJOR layout. For max and min this
-            does not apply on Quasar, nor to a FLOAT32 min (or max with a negative `scalar`) that runs with
-            `fp32_dest_acc_en=False`.
+            does not apply to a max along -1 on Quasar, nor to a FLOAT32 min (or max with a negative
+            `scalar`) that runs with `fp32_dest_acc_en=False` or on Quasar.
 
         Memory Support:
             - Interleaved: DRAM and L1
