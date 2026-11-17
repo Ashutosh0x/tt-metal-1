@@ -757,7 +757,7 @@ class Attention(Module):
             )
         else:
             assert (
-                sequence_1_length == spatial.shape[1]
+                sequence_1_length == q.shape[2]
             ), "spatial sequence must not be padded without sequence parallelism"
 
             spatial, sequence_2 = ttnn.transformer.joint_scaled_dot_product_attention(
