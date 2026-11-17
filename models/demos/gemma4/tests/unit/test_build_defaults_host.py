@@ -42,6 +42,7 @@ from models.demos.gemma4.tt.mesh_orientation import clear_decode_fusion_profile
 from models.demos.gemma4.tt.model import apply_build_profile
 from models.demos.gemma4.tt.model_config import Gemma4ModelArgs
 from models.demos.gemma4.tt.precision import Gemma4Precision
+from models.demos.gemma4.utils.substate import substate
 
 
 @pytest.fixture()
@@ -717,8 +718,11 @@ def test_real_state_dict_never_refused(tmp_path):
 
 
 def test_placeholder_refused_when_tensorbin_missing(tmp_path, expect_error):
+    # The experts get substate(state_dict, "experts") (moe.py): the marker must survive it.
+    experts = substate(_Placeholder({"experts.gate_up_proj": torch.empty(1)}), "experts")
+    assert getattr(experts, "is_placeholder", False)
     with expect_error(RuntimeError, "cache miss"):
-        _refuse_placeholder_on_cache_miss(_Placeholder(), [str(tmp_path / "gate_up_proj_x")], ttnn.bfloat8_b)
+        _refuse_placeholder_on_cache_miss(experts, [str(tmp_path / "gate_up_proj_x")], ttnn.bfloat8_b)
 
 
 def test_placeholder_refused_without_cache_path(expect_error):
