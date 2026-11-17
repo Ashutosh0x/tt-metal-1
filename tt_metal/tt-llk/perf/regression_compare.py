@@ -52,6 +52,13 @@ def _is_metric(col):
 
 MODULE_COL = "test_module"
 
+# Columns renamed in helpers/perf/test_schemas.py (`aliases`, old -> new). This file
+# cannot import that module, so a baseline written under the old name is mapped here.
+COLUMN_ALIASES = {
+    "reduce_pool_type": "pool_type",
+    "ternary_mathop": "mathop",
+}
+
 
 def _canonical_module(module):
     return canonical_test_name(module)
@@ -143,6 +150,13 @@ def _read_frames(paths):
     frames = []
     for path in paths:
         frame = pd.read_csv(path)
+        frame = frame.rename(
+            columns={
+                old: new
+                for old, new in COLUMN_ALIASES.items()
+                if old in frame.columns and new not in frame.columns
+            }
+        )
         if MODULE_COL not in frame.columns:
             frame[MODULE_COL] = _module_of(path)
         frame[MODULE_COL] = frame[MODULE_COL].map(_canonical_module)
