@@ -96,9 +96,10 @@ def gemma4_cache_layout(mesh_device, mesh_config):
         "moe_dispatch_prefill": "1"
         if dispatch_prefill_default(getattr(mesh_device, "shape", None), blackhole=is_blackhole())
         else "0",
-        # The local routed prefill (experts/local_routed_prefill.py) loads the routed experts into the kernel's
-        # per-expert cache files too (layer_<i>.local_routed_<rows>x<cols>.*).
-        "moe_local_routed_prefill": os.environ.get("GEMMA4_MOE_LOCAL_ROUTED_PREFILL", "0"),
+        # The first local routed prefill wrote per-expert cache files of its own (layer_<i>.local_routed_*); the
+        # current one (experts/local_routed_prefill.py) reads the decode copy and writes none, so the key stays at
+        # the value every existing marker carries and no setting of the knob forces a cold load.
+        "moe_local_routed_prefill": "0",
     }
     # GEMMA4_SDPA_PAIR_SPLIT adds the pair QKV / o_proj copies of the global layers (*_pair_* tensorbins) on a one-row
     # mesh with even columns: a marker seeded without them must not certify such a build. The key is absent when the

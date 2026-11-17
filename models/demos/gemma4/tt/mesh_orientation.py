@@ -16,7 +16,11 @@ Defaults (every one overridable):
 * ``GEMMA4_MOE_DISPATCH_PREFILL``: unset -> on for a Blackhole (4,1) mesh (``dispatch_prefill_default``), with
   ``GEMMA4_MOE_DISPATCH_MIN_TOKENS`` defaulting to 128 there (the measured configuration) and 256 elsewhere;
 * ``GEMMA4_MOE_DISPATCH_FIT_CHUNK``: unset -> on wherever the dispatch path is the default (``fit_chunk_default``):
-  a short call runs on a dispatch chunk of its own length instead of the 4096-row padded chunk.
+  a short call runs on a dispatch chunk of its own length instead of the 4096-row padded chunk;
+* ``GEMMA4_MOE_LOCAL_ROUTED_PREFILL``: unset -> on wherever the dispatch path is the default
+  (``local_routed_prefill_default``): prefill calls the small-row path does not take run the local routed experts
+  (experts/local_routed_prefill.py: no token moves between chips, the decode copy of the experts) instead of the
+  token dispatch / combine; ``0`` returns them to the dispatch path.
 """
 
 import os
@@ -88,6 +92,20 @@ def fit_chunk_default(shape, *, blackhole: bool) -> bool:
     column mesh: 128-token TTFT 213 -> 151 ms, 2048-token 382 -> 303 ms, logits PCC 1.000, 2026-10-23) and off elsewhere.
     """
     env = os.environ.get(FIT_CHUNK_ENV)
+    if env is not None and env.strip() != "":
+        return env.strip() == "1"
+    return dispatch_prefill_default(shape, blackhole=blackhole)
+
+
+LOCAL_ROUTED_ENV = "GEMMA4_MOE_LOCAL_ROUTED_PREFILL"
+
+
+def local_routed_prefill_default(shape, *, blackhole: bool) -> bool:
+    """Whether the routed-expert prefill takes the local path (experts/local_routed_prefill.py):
+    ``GEMMA4_MOE_LOCAL_ROUTED_PREFILL`` when set, else on wherever the dispatch path is the default (a Blackhole (4,1)
+    column mesh: every chip holds every token and 32 whole experts, so the dispatch / combine moved tokens that were
+    already there). The builder still checks that the build can take it (``local_routed_reason``)."""
+    env = os.environ.get(LOCAL_ROUTED_ENV)
     if env is not None and env.strip() != "":
         return env.strip() == "1"
     return dispatch_prefill_default(shape, blackhole=blackhole)
