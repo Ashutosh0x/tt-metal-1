@@ -1382,11 +1382,13 @@ def test_sparse_mla_chunked_sp_axis_1(
     SPARSE_SP1_MESH_CASES,
     indirect=["variant", "mesh_device", "device_params"],
 )
-@pytest.mark.parametrize("case", ["accuracy", "determinism", "indexer_reuse", "kv_only", "pad_overflow", "rotated"])
+@pytest.mark.parametrize(
+    "case", ["accuracy", "determinism", "indexer_reuse", "indexer_reuse_push_off", "kv_only", "pad_overflow", "rotated"]
+)
 @pytest.mark.skipif(not is_blackhole(), reason="DSA ops (indexer / sparse SDPA) are Blackhole-only")
 @pytest.mark.timeout(0)
 def test_sparse_mla_sp_axis_1(
-    mesh_device, device_params, case, variant, config_only, ds_layer, ds_checkpoint, ds_repo, ds_input
+    mesh_device, device_params, case, variant, config_only, ds_layer, ds_checkpoint, ds_repo, ds_input, monkeypatch
 ):
     seq_len, chunk, fmt = 5120, 1024, MlaKvCacheFormat.BF16_RM
     topology = per_axis_topology(device_params["fabric_config"])
@@ -1396,6 +1398,11 @@ def test_sparse_mla_sp_axis_1(
     elif case == "determinism":
         run_sparse_mla_determinism_case(variant, config_only, mesh_device, seq_len, 3, topology, *ds, sp_axis=1)
     elif case == "indexer_reuse":
+        run_sparse_mla_indexer_reuse_case(variant, config_only, mesh_device, seq_len, device_params, *ds, sp_axis=1)
+    elif case == "indexer_reuse_push_off":
+        # The same compute-vs-inject check with shared layers gathering the whole prefix instead of receiving it
+        # through the sparse KV push, which isolates the push on meshes that enable it.
+        monkeypatch.setattr(mla_module, "sparse_kv_push_supported", lambda *_: False)
         run_sparse_mla_indexer_reuse_case(variant, config_only, mesh_device, seq_len, device_params, *ds, sp_axis=1)
     elif case == "kv_only":
         run_sparse_mla_kv_only_case(variant, config_only, mesh_device, seq_len, chunk, fmt, *ds, sp_axis=1)
