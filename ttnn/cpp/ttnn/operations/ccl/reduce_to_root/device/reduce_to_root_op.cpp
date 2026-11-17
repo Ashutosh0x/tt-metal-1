@@ -122,8 +122,10 @@ ReduceToRootOp::spec_return_value_t ReduceToRootOp::compute_output_specs(
         l_shard_spec.grid, {shard_height, intermediate_shard_width}, l_shard_spec.orientation);
     tt::tt_metal::MemoryConfig intermediate_memory_config(
         l_memory_config.memory_layout(), l_memory_config.buffer_type(), intermediate_shard_spec);
+    const auto& l_layout = final_output_spec[0].tensor_layout();
     tt::tt_metal::TensorSpec intermediate_spec(
-        intermediate_shape, final_output_spec[0].tensor_layout().with_memory_config(intermediate_memory_config));
+        intermediate_shape,
+        tt::tt_metal::TensorLayout(l_layout.get_data_type(), l_layout.get_page_config(), intermediate_memory_config));
     intermediate_specs.push_back(intermediate_spec);
 
     return {intermediate_specs, final_output_spec};

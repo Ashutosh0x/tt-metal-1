@@ -186,6 +186,8 @@ public:
     // Get the element size in bytes
     std::size_t element_size() const;
 
+    [[deprecated(
+        "Use tt::tt_metal::compute_strides(padded_shape()) instead. This API will be removed after 2027-02-17.")]]
     Strides strides() const;
 
     // Applies a transformation function to each host buffer across devices in parallel, returning a new HostTensor.
