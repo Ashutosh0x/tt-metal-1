@@ -91,16 +91,24 @@ class Gemma4Experts:
         self.dispatch_min_tokens = dispatch_min_tokens_default(_shape, blackhole=is_blackhole())
         if dispatch_prefill_default(_shape, blackhole=is_blackhole()) and is_mesh and mesh_device.get_num_devices() > 1:
             # imported here: the DeepSeek dispatch/combine stack is only needed on this path
-            from models.demos.gemma4.tt.experts.dispatch_prefill import Gemma4DispatchExperts
+            from models.demos.gemma4.tt.experts.dispatch_prefill import Gemma4DispatchExperts, shared_weights_reason_for
 
             reason = Gemma4DispatchExperts.unsupported_reason(mesh_device)
             if reason is not None:
                 _warn_once("dispatch_prefill", f"dispatch prefill off, sparse_matmul experts: {reason}")
             else:
                 placeholder = bool(getattr(state_dict, "is_placeholder", False))
+                # One copy of the routed experts where the decode copy is already the dispatch layout (the whole-expert
+                # tp-only line, GEMMA4_MOE_DISPATCH_SHARED_WEIGHTS): the GeGLU experts read self.weights and no
+                # per-expert copy (nor its host list) is made.
+                shared = (
+                    self.weights
+                    if shared_weights_reason_for(mesh_device, mesh_config, self.weights, config.num_experts) is None
+                    else None
+                )
                 hf_list = (
                     None
-                    if placeholder
+                    if placeholder or shared is not None
                     else Gemma4DispatchExperts.hf_expert_list(state_dict["gate_up_proj"], state_dict["down_proj"])
                 )
                 self.dispatch_experts = Gemma4DispatchExperts(
@@ -110,6 +118,8 @@ class Gemma4Experts:
                     tensor_cache_path=tensor_cache_path,
                     weights_dtype=weight_dtype,
                     ccl_manager=self.ccl_manager,
+                    shared_weights=shared,
+                    mesh_config=mesh_config,
                 )
         # Optional local token-sorted routed prefill (GEMMA4_MOE_LOCAL_ROUTED_PREFILL=1, experts/local_routed_prefill.py):
         # on the whole-expert tp-only shapes every chip holds every token, so the routed (token, expert) pairs are

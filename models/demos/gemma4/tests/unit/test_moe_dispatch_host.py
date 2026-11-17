@@ -44,6 +44,11 @@ from models.demos.gemma4.tt.moe import MoEBlock
 @pytest.fixture()
 def _clean_env(monkeypatch):
     monkeypatch.delenv(dp.FIT_CHUNK_ENV, raising=False)
+    monkeypatch.delenv(dp.SHARED_WEIGHTS_ENV, raising=False)
+
+
+# the 26B-A4B decode copy on the (4,1) column mesh: whole experts, tp 4 over the rows, 32 experts per chip
+_SHARED_26B = dict(ep=1, tp=4, tp_axis=0, num_local_experts=32, num_experts=128)
 
 
 @pytest.mark.usefixtures("_clean_env")
@@ -56,6 +61,16 @@ def test_fit_chunk_default_follows_the_dispatch_default():
     assert not fit_chunk_default((8, 4), blackhole=True)
     assert dp.fit_chunk_tokens(128, 4, 4096, fit=False) == 4096
     assert dp.fit_chunk_tokens(4096, 4, 4096, fit=True) == 4096
+    # the dispatch experts read the decode copy exactly where its whole-expert partition is the dispatch layout
+    reason = lambda shape, **kw: dp.shared_weights_reason(shape, **{**_SHARED_26B, **kw})  # noqa: E731
+    assert reason((4, 1)) is None  # the column mesh: one dispatch group = the tp group, chip c owns [32c, 32c+32)
+    assert reason((1, 4), tp_axis=1) is None  # the ring transport's row: the same placement along the columns
+    assert "tp group" in reason((4, 1), tp_axis=1)
+    assert "dispatch groups" in reason((2, 4), tp=4, tp_axis=1, ep=2, num_local_experts=16)
+    assert "dispatch groups" in reason((8, 4), tp=8, tp_axis=0, ep=4, num_local_experts=4)
+    assert "lanes" in reason((4, 1), ep=2)
+    assert "experts per chip" in reason((4, 1), num_local_experts=128)
+    assert "interleaved" in reason((4, 1), interleaved=False)
 
 
 @pytest.mark.usefixtures("_clean_env")
@@ -67,6 +82,11 @@ def test_fit_chunk_env_overrides_the_default(monkeypatch):
     monkeypatch.setenv(dp.FIT_CHUNK_ENV, "1")
     assert fit_chunk_default((1, 4), blackhole=True)
     assert fit_chunk_default((8, 4), blackhole=False)
+    # GEMMA4_MOE_DISPATCH_SHARED_WEIGHTS=0 brings the per-expert copy back on the shape that shares by default
+    monkeypatch.setenv(dp.SHARED_WEIGHTS_ENV, "0")
+    assert dp.shared_weights_reason((4, 1), **_SHARED_26B) == f"{dp.SHARED_WEIGHTS_ENV}=0"
+    monkeypatch.setenv(dp.SHARED_WEIGHTS_ENV, "1")
+    assert dp.shared_weights_reason((4, 1), **_SHARED_26B) is None
 
 
 @pytest.mark.usefixtures("_clean_env")
