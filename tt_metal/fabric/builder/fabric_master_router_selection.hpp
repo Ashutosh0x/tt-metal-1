@@ -17,7 +17,7 @@ namespace tt::tt_fabric {
 // The leader's kernel carries the extra handshake code, so ideally we designate the master router role to a router that
 // has a small kernel size. A router's size follows from its compile-time arguments:
 //   - the route decode (router_route_decode.hpp). A router on a mesh's edge (IS_INTRAMESH_ROUTER_ON_EDGE) decodes for
-//     its facing and also checks every packet for leaving the mesh here, whereas an intermesh router 
+//     its facing and also checks every packet for leaving the mesh here, whereas an intermesh router
 //     (IS_INTERMESH_ROUTER) only takes in packets that have just landed, so its decode is the one Y-first function.
 //   - the live downstreams of each VC it forwards on. Each one adds a copy of the per-packet forward, free-slot check
 //     and credit read code (router_downstream.hpp, live_downstreams<VC>()).
