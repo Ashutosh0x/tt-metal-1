@@ -44,6 +44,8 @@ inline std::string get_generic_reduction_doc(
     const char* fast_approx_kwarg = !has_fast_approximate_mode           ? ""
                                     : std::string_view(op_name) == "min" ? R"doc(
             fast_and_approximate_mode (bool, optional): must stay `False` (the default) for FLOAT32. The FPU has no min pool, so there is no faster path to select: a FLOAT32 min with `True` is rejected rather than lowered to `-max(-x)`. No effect for non-FLOAT32 inputs.)doc"
+                                    : std::string_view(op_name) == "max" ? R"doc(
+            fast_and_approximate_mode (bool, optional): FLOAT32 only. `False` (default) uses the accurate SFPU path; `True` uses the faster FPU path (inputs truncated to TF32, higher ULP error). The accurate path requires a compute_kernel_config with `fp32_dest_acc_en=True` and is unavailable on Quasar; in those cases it falls back to the FPU. A negative `scalar` computes `scalar * min(x)`, and the FPU has no min pool, so the flag has no effect there. No effect for non-FLOAT32 inputs.)doc"
                                                                          : R"doc(
             fast_and_approximate_mode (bool, optional): FLOAT32 only. `False` (default) uses the accurate SFPU path (full float32 accumulation); `True` uses the faster FPU path (inputs truncated to TF32, higher ULP error). The accurate path requires a compute_kernel_config with `fp32_dest_acc_en=True` and is unavailable on Quasar; in those cases it falls back to the FPU. No effect for non-FLOAT32 inputs.)doc";
     return fmt::format(
@@ -84,7 +86,7 @@ inline std::string get_generic_reduction_doc(
             Exception: 4D ROW_MAJOR BFLOAT16/FLOAT32 inputs with INTERLEAVED memory config reduced along
             the last (-1) or second-to-last (-2) dimension preserve ROW_MAJOR layout. For max and min this
             does not apply on Quasar, nor to a FLOAT32 min (or max with a negative `scalar`) that runs with
-            `fp32_dest_acc_en=False` or `fast_and_approximate_mode=True`.
+            `fp32_dest_acc_en=False`.
 
         Memory Support:
             - Interleaved: DRAM and L1

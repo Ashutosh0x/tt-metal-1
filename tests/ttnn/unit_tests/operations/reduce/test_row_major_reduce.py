@@ -944,8 +944,8 @@ def test_rm_reduce_minmax_scalar(device, reduce_op, dtype, scalar, dim):
 # and keep its TILE output; an explicit output_layout is still honored.
 @pytest.mark.parametrize(
     "reduce_op, scalar, fast_and_approximate_mode, fp32_dest_acc_en",
-    [("min", 1.0, False, False), ("max", -1.0, True, True), ("max", -1.0, False, False)],
-    ids=["min_acc_off", "max_negscalar_fast", "max_negscalar_acc_off"],
+    [("min", 1.0, False, False), ("max", -1.0, False, False)],
+    ids=["min_acc_off", "max_negscalar_acc_off"],
 )
 @pytest.mark.parametrize("output_layout", [None, ttnn.ROW_MAJOR_LAYOUT], ids=["default", "rm"])
 @pytest.mark.parametrize("dim", [-1, -2])
@@ -978,6 +978,26 @@ def test_rm_reduce_minmax_negate_fallback(
     assert_numeric_metrics(
         torch_ref, ttnn.to_torch(tt_output), rtol=1e-2, atol=0, check_frobenius=False, check_pcc=False
     )
+
+
+# A negative scalar turns max into a min, which runs on the SFPU whatever fast_and_approximate_mode says,
+# so it stays on the dense RM path and exact.
+@pytest.mark.parametrize("dim", [-1, -2])
+def test_rm_reduce_max_negative_scalar_fast_mode(device, dim):
+    if device.arch() == ttnn.device.Arch.QUASAR:
+        pytest.skip("Quasar has no FLOAT32 SFPU reduce")
+    torch.manual_seed(0)
+    torch_input = torch.randn((2, 3, 70, 300), dtype=torch.float32)
+    torch_ref = torch.amax(torch_input * -2.5, dim=dim, keepdim=True)
+    tt_input = ttnn.from_torch(torch_input, dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+
+    tt_output, ops = _device_ops(
+        lambda: ttnn.max(tt_input, dim=dim, keepdim=True, scalar=-2.5, fast_and_approximate_mode=True)
+    )
+
+    assert ops == ["Reduce"], f"expected the dense RM path without a tilize, got {ops}"
+    assert tt_output.layout == ttnn.ROW_MAJOR_LAYOUT
+    assert torch.equal(ttnn.to_torch(tt_output), torch_ref)
 
 
 # ±inf is a legal value, not padding: it must win (or lose) exactly as in torch.

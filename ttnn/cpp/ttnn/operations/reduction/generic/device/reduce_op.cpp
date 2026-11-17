@@ -202,14 +202,16 @@ Tensor reduce(
     // to the FPU without fp32_dest_acc_en or on Quasar (no SFPU reduce LLKs). The dense RM kernels
     // share the same SFPU fold via CT arg 6. negate=true marks the FPU's -MAX(-x) min lowering,
     // which has no SFPU fold, so MAX/MIN exclude it.
-    const bool fp32_sfpu_eligible = !fast_and_approximate_mode &&
-                                    input_tensor.dtype() == tt::tt_metal::DataType::FLOAT32 &&
-                                    arch != tt::ARCH::QUASAR && config.fp32_dest_acc_en;
+    const bool fp32_sfpu_capable =
+        input_tensor.dtype() == tt::tt_metal::DataType::FLOAT32 && arch != tt::ARCH::QUASAR && config.fp32_dest_acc_en;
+    const bool fp32_sfpu_eligible = fp32_sfpu_capable && !fast_and_approximate_mode;
 
     const bool use_sfpu_fp32_sum = fp32_sfpu_eligible && reduce_math == tt::tt_metal::ReduceOpMath::SUM;
     const bool use_sfpu_fp32_mean = fp32_sfpu_eligible && reduce_math == tt::tt_metal::ReduceOpMath::AVG;
     const bool use_sfpu_fp32_max = fp32_sfpu_eligible && reduce_math == tt::tt_metal::ReduceOpMath::MAX && !negate;
-    const bool use_sfpu_fp32_min = fp32_sfpu_eligible && reduce_math == tt::tt_metal::ReduceOpMath::MIN && !negate;
+    // fast_and_approximate_mode selects the FPU, which has no MIN, so a FLOAT32 MIN takes the SFPU either way.
+    // ttnn.min rejects the flag; it reaches here through ttnn.max with a negative scalar.
+    const bool use_sfpu_fp32_min = fp32_sfpu_capable && reduce_math == tt::tt_metal::ReduceOpMath::MIN && !negate;
 
     // MIN selects rather than accumulates, and bf16 reaches SrcA untruncated, so this path does not
     // take the fp32 accuracy or fp32_dest_acc_en gates.
@@ -220,8 +222,8 @@ Tensor reduce(
         use_sfpu_fp32_sum || use_sfpu_fp32_mean || use_sfpu_fp32_max || use_sfpu_fp32_min || use_sfpu_bf16_min;
 
     // The FPU has no MIN primitive, so remaining MIN lowers to -MAX(-x) via the fused negate kernels:
-    // bfloat8_b and fast-mode fp32. Accurate fp32 MIN and bf16 MIN drive the LLK MIN
-    // reduce directly (like Int32 MIN) and must skip that lowering.
+    // bfloat8_b, and FLOAT32 without fp32_dest_acc_en or on Quasar. Other fp32 MIN and bf16 MIN drive
+    // the LLK MIN reduce directly (like Int32 MIN) and must skip that lowering.
     if (reduce_math == tt::tt_metal::ReduceOpMath::MIN && input_tensor.dtype() != tt::tt_metal::DataType::INT32 &&
         !use_sfpu_fp32_min && !use_sfpu_bf16_min) {
         TT_FATAL(
