@@ -105,11 +105,17 @@ stage of a real distributed job, grouped by the piece that fails:
   paths leave nothing either: a singleton that raises exits normally instead of `MPI_Abort`, so the atexit runs
   (`test_singleton_raise_leaves_nothing`), and a killed singleton's directory, which carries its `owner.pid`, is swept
   by the next singleton init (`test_singleton_killed_leaves_nothing`);
+- **a killed launcher's session directory** (P25) — two layers: tt-run removes the `prterun.<host>.<pid>.<uid>`
+  directory of a launcher that never ran its exit path, before launch and in its teardown (#65121,
+  `test_launcher_killed_no_session_dir`); and because that reaches the launch host only, a launched rank's context
+  sweeps the stale launcher directories of its own host at init, found through PMIx's `PMIX_SYSTEM_TMPDIR` and
+  never this job's own `PMIX_SERVER_TMPDIR` (`test_context_sweeps_stale_launcher_dir`, launched with mpirun directly
+  so tt-run's sweep cannot be the one that removes it);
 - **still open, as strict xfails** — the suite stays green and a row turns red the day its fix lands, so the fix
-  PR drops the marker: a helper that outlives a cleanly exiting rank (`test_helper_outlives_rank`, P24), a killed
-  launcher's session directory (`test_launcher_killed_no_session_dir`, P25, tt-run's), SIGTERM running the device
-  teardown (`test_sigterm_runs_close`, P28), and a hang with no timeout set anywhere (`test_hang_without_any_timeout`,
-  P30, a default-policy decision). Each has a `TODO(teardown P..)` at the line that should own it.
+  PR drops the marker: a helper that outlives a cleanly exiting rank (`test_helper_outlives_rank`, P24), SIGTERM
+  running the device teardown (`test_sigterm_runs_close`, P28), and a hang with no timeout set anywhere
+  (`test_hang_without_any_timeout`, P30, a default-policy decision). Each has a `TODO(teardown P..)` at the line
+  that should own it.
 
 ### Group G — raw-MPI expectation gates
 Two gates that confirm the OpenMPI build we ship provides what the DistributedContext teardown relies on — not

@@ -193,6 +193,45 @@ static void remove_singleton_session_dir() {
     }
 }
 
+// Teardown plan P25: the launcher's session directory (prterun.<host>.<pid>.<uid>) is PRRTE's. prterun removes it on
+// its exit path and tt-run sweeps the launch host's stale ones (#65121); a launcher killed on a REMOTE host leaves its
+// directory where only the next job's ranks can see it. So every launched rank's context sweeps the stale launcher
+// directories of its own host too. PMIx tells the rank where they live: PMIX_SYSTEM_TMPDIR is the temp root the
+// launcher used, PMIX_SERVER_TMPDIR is this job's own directory (live, kept). The owner pid is in the name, and a
+// directory whose owner is gone is stale. Reads only, after MPI_Init (no environment write, see P29 above).
+static void sweep_stale_launcher_dirs() {
+    const char* root = std::getenv("PMIX_SYSTEM_TMPDIR");
+    const char* own = std::getenv("PMIX_SERVER_TMPDIR");
+    if (root == nullptr) {
+        return;
+    }
+    const std::string suffix = "." + std::to_string(::getuid());
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (!entry.is_directory(ec) || name.rfind("prterun.", 0) != 0 || name.size() <= suffix.size() ||
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            continue;
+        }
+        if (own != nullptr && std::string(own).rfind(entry.path().string(), 0) == 0) {
+            continue;  // this job's own launcher
+        }
+        const std::string stem = name.substr(0, name.size() - suffix.size());
+        const auto dot = stem.rfind('.');
+        if (dot == std::string::npos) {
+            continue;
+        }
+        char* end = nullptr;
+        const long pid = std::strtol(stem.c_str() + dot + 1, &end, 10);
+        if (pid <= 0 || end == nullptr || *end != '\0') {
+            continue;
+        }
+        if (::kill(static_cast<pid_t>(pid), 0) == -1 && errno == ESRCH) {  // the launcher is gone: stale
+            std::filesystem::remove_all(entry.path(), ec);
+        }
+    }
+}
+
 // Teardown plan P32: a singleton that was killed could not remove its directory; the next singleton init on this host
 // removes the directories whose owner (the pid written into owner.pid at creation) no longer exists.
 static void sweep_stale_singleton_dirs(const std::filesystem::path& base) {
@@ -416,6 +455,14 @@ inline void init_env(int& argc, char**& argv) {
                 setenv("TMPDIR", caller_tmpdir.c_str(), /*overwrite=*/1);
             } else {
                 unsetenv("TMPDIR");
+            }
+        }
+
+        if (launched) {
+            // P25: one rank per host is enough; the local rank is PMIx/Open MPI's, 0 when absent.
+            const char* local_rank = std::getenv("OMPI_COMM_WORLD_LOCAL_RANK");
+            if (local_rank == nullptr || std::string(local_rank) == "0") {
+                sweep_stale_launcher_dirs();
             }
         }
 

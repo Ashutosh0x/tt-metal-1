@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import signal
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,7 @@ sys.path.insert(
     0, str(Path(__file__).resolve().parent)
 )  # sanity_common lives next to this file, whatever the import mode
 from sanity_common import (
+    _session_dirs,
     CONFLICT_DESC,
     DEADLINE_END,
     DEADLINE_HANG,
@@ -42,6 +44,7 @@ from sanity_common import (
     ended,
     fault_delivered,
     legacy_cmd,
+    mpirun_path,
     nonzero,
     rc_contains,
     run_case,
@@ -501,13 +504,10 @@ def test_helper_outlives_rank():
     assert r.exit == 0, str(r)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="P25: a killed launcher leaves its session directory under /tmp; fix: tt-run sweeps this user's unowned launcher session dirs next to the shm sweep",
-)
 def test_launcher_killed_no_session_dir():
-    """kill -9 of prterun while the ranks sit in a collective: tt-run ends the orphaned ranks (#65121), but prterun's
-    exit path never ran, so its session directory under /tmp stays. Nothing may be left, directories included."""
+    """kill -9 of prterun while the ranks sit in a collective: tt-run ends the orphaned ranks and, since prterun's exit
+    path never ran, removes its session directory under /tmp itself (P25, #65121). Nothing may be left, directories
+    included."""
     r = run_case(
         "launcher_killed",
         {"PROBE_COLL": "send_no_recv"},
@@ -525,6 +525,42 @@ def test_launcher_killed_no_session_dir():
 # ---------------------------------------------------------------------------------------------------------------
 # the remaining gaps only the DistributedContext can close (plan P26-P30): one strict xfail each, a TODO at the owner
 # ---------------------------------------------------------------------------------------------------------------
+def test_context_sweeps_stale_launcher_dir(tmp_path):
+    """P25, the fail-safe inside the rank: tt-run's sweep (#65121) reaches the launch host only. A launcher killed on a
+    remote host leaves its session directory where only the next job's ranks can see it, so a launched rank's context
+    removes the stale launcher directories of its own host at init: the ones whose owner pid (in the name,
+    prterun.<host>.<pid>.<uid>) is gone, found through PMIx's PMIX_SYSTEM_TMPDIR, never this job's own
+    (PMIX_SERVER_TMPDIR). Launched with mpirun directly so tt-run's own sweep cannot be the one that removes it."""
+    import socket
+    import subprocess
+
+    helper = subprocess.Popen(["true"])  # a pid that has exited: nobody owns it any more
+    helper.wait()
+    stale = Path(tempfile.gettempdir()) / f"prterun.{socket.gethostname()}.{helper.pid}.{os.getuid()}"
+    (stale / "hwloc.sm").mkdir(parents=True, exist_ok=True)
+    assert str(stale) in _session_dirs()
+    code = "import ttnn; ttnn.init_distributed_context(); print('CTX_OK', flush=True)"
+    cmd = [
+        mpirun_path(),
+        "--mca",
+        "btl",
+        "self,tcp",
+        "--allow-run-as-root",
+        "--oversubscribe",
+        "-np",
+        "1",
+        PYTHON,
+        "-c",
+        code,
+    ]
+    r = run_case("context_sweeps_stale", {"TT_METAL_MOCK_CLUSTER_DESC_PATH": str(CONFLICT_DESC)}, DEADLINE_END, cmd=cmd)
+    ended(r)
+    assert r.exit == 0, str(r)
+    assert "CTX_OK" in r.log, str(r)
+    assert not stale.exists(), f"the stale launcher directory survived the next job's init: {stale}"
+    clean(r)
+
+
 def test_exit1_hangs_peer():
     """Rank 1 calls sys.exit(1) after open, the way click or a script's error return does. P26: sys.exit records
     the code and a Python atexit aborts the job with it before the context's finalize could fence on the peers."""
