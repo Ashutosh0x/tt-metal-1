@@ -60,6 +60,17 @@ void validate_matmul_operand_basics(
         is_floating_point(input_tensor_b.dtype()), "Unsupported data format for input B: {}", input_tensor_b.dtype());
 }
 
+// Matmul writes DEST (float) directly to the output through the packer. An integer dtype=
+// reinterprets the float bits as the integer value; reject it and point users at ttnn.typecast
+// on the float-dtype result. Issue #58372.
+inline void validate_matmul_output_dtype(DataType output_dtype) {
+    TT_FATAL(
+        is_floating_point(output_dtype),
+        "Matmul: integer output dtype {} would reinterpret float result bits; run matmul with a float dtype and "
+        "cast with ttnn.typecast.",
+        output_dtype);
+}
+
 // Matrix Dimensions: checks ranks, K/M/N > 0, and that A's K equals B's K.
 // The a_shape/b_shape passed in are already transpose-adjusted, so K sits at [-1] for A
 // (width) and [-2] for B (height); B's K is read manually after b.rank >= 2 is verified.
@@ -2788,6 +2799,10 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
     const auto& input_tensor_a = args.input_tensors.at(0);
     const auto& input_tensor_b = args.input_tensors.at(1);
     const auto& optional_input_tensors = args.optional_input_tensors;
+
+    if (attributes.output_dtype.has_value()) {
+        validate_matmul_output_dtype(attributes.output_dtype.value());
+    }
 
     auto a_shape =
         operations::matmul::utilities::get_matmul_tensor_logical_shape(input_tensor_a, attributes.transpose_a);
