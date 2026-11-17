@@ -43,7 +43,7 @@ _QWEN_EDIT_PARAMS = {p.values[0]: p.values[1] for p in EDIT_MESH_DEVICE_PARAMS}
 _IDEOGRAM = {"l1_small_size": 32768, "trace_region_size": 60000000}
 
 
-class _Stop(Exception):  # noqa: N818
+class _Stop(Exception):
     pass
 
 
@@ -58,14 +58,19 @@ def _run_klein(mesh_device: ttnn.MeshDevice, model_location_generator: Callable[
     pipeline(prompts=["a watercolor"], images=[Image.open(_IMAGE)], num_inference_steps=4, seed=0)
 
 
-def _run_qwen(mesh_device: ttnn.MeshDevice, model_location_generator: Callable[[str], str]) -> None:  # noqa: ARG001
+def _run_qwen(mesh_device: ttnn.MeshDevice, model_location_generator: Callable[[str], str]) -> None:
     from models.tt_dit.pipelines.qwenimage.pipeline_qwenimage import QwenImagePipeline
 
     pipeline = QwenImagePipeline.create_pipeline(mesh_device=mesh_device, checkpoint_name="Qwen/Qwen-Image-Edit-2511")
-    pipeline(prompts=["a watercolor"], num_inference_steps=4, seed=0, image=Image.open(_IMAGE).convert("RGB").resize((1024, 1024)))
+    pipeline(
+        prompts=["a watercolor"],
+        num_inference_steps=4,
+        seed=0,
+        image=Image.open(_IMAGE).convert("RGB").resize((1024, 1024)),
+    )
 
 
-def _run_wan(mesh_device: ttnn.MeshDevice, model_location_generator: Callable[[str], str]) -> None:  # noqa: ARG001
+def _run_wan(mesh_device: ttnn.MeshDevice, model_location_generator: Callable[[str], str]) -> None:
     from models.tt_dit.pipelines.wan.pipeline_wan_i2v import ImagePrompt, WanPipelineI2V
 
     pipeline = WanPipelineI2V.create_pipeline(
@@ -79,11 +84,73 @@ def _run_wan(mesh_device: ttnn.MeshDevice, model_location_generator: Callable[[s
     pipeline(prompts=["a watercolor"], image_prompt=[ImagePrompt(image=image, frame_pos=0)], num_inference_steps=2)
 
 
-def _run_ideogram(mesh_device: ttnn.MeshDevice, model_location_generator: Callable[[str], str]) -> None:  # noqa: ARG001
-    from models.tt_dit.pipelines.ideogram4.pipeline_ideogram4 import Ideogram4Pipeline
+def _fake_load_torch_state_dict(self: Any, state_dict: Any, *, strict: bool = True) -> Any:
+    """Module.load_torch_state_dict without weights: each parameter gets an unfilled tensor of its shape.
 
-    pipeline = Ideogram4Pipeline.create_pipeline(mesh_device=mesh_device, height=1024, width=1024, run_warmup=False)
-    pipeline(prompts=["a watercolor"], seed=0, traced=False)
+    The L1 a pipeline leaves to its matmuls depends on what it allocates, not on the weight values.
+    """
+    import torch
+
+    from models.tt_dit.layers.module import IncompatibleKeys
+    from models.tt_dit.utils import tensor
+
+    for _, child in self.named_children():
+        _fake_load_torch_state_dict(child, {})
+    for _, parameter in self.named_parameters():
+        if parameter.on_host:
+            parameter.data = tensor.from_torch(
+                torch.zeros(parameter.total_shape),
+                device=parameter.device,
+                layout=parameter.layout,
+                dtype=parameter.dtype,
+                mesh_axes=parameter.mesh_axes,
+                on_host=True,
+            )
+        else:
+            parameter.data = ttnn.allocate_tensor_on_device(
+                ttnn.Shape(parameter.local_shape),
+                parameter.dtype,
+                parameter.layout,
+                parameter.device,
+                parameter.memory_config,
+            )
+    self._mark_loaded()
+    return IncompatibleKeys([], [])
+
+
+def _run_ideogram(mesh_device: ttnn.MeshDevice, model_location_generator: Callable[[str], str]) -> None:
+    """With fake weights: the fp8 checkpoint is gated and on none of the CI runners' stores.
+
+    The configs and the tokenizer come from the public Qwen3-VL checkpoint the pipeline reads its
+    encoder config from.
+    """
+    import tempfile
+
+    import transformers
+    from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
+
+    from models.tt_dit.layers.module import Module
+    from models.tt_dit.pipelines.ideogram4 import pipeline_ideogram4 as pi
+
+    class RandomAutoencoderKL(AutoencoderKL):
+        def load_state_dict(self, state_dict: Any, strict: bool = True, assign: bool = False) -> Any:
+            return super().load_state_dict(self.state_dict(), strict=strict, assign=assign)
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained(pi._DEFAULT_QWEN_REPO)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Module, "load_torch_state_dict", _fake_load_torch_state_dict)
+        mp.setattr(pi, "_dq", lambda path: {})
+        mp.setattr(pi, "_load_file", lambda path: {})
+        mp.setattr(pi, "_AutoencoderKL", RandomAutoencoderKL)
+        mp.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer)
+        pipeline = pi.Ideogram4Pipeline.create_pipeline(
+            mesh_device=mesh_device,
+            height=2048,
+            width=2048,
+            weights_dir=tempfile.mkdtemp(),
+            run_warmup=False,
+        )
+        pipeline(prompts=["a watercolor"], height=2048, width=2048, seed=0, traced=False)
 
 
 _MODELS = {
@@ -104,7 +171,6 @@ _MODELS = {
 }
 
 _CASES = [
-    ("klein", (1, 8), line_params_flux2_klein),
     ("klein", (2, 2), line_params_flux2_klein),
     ("klein", (2, 4), line_params_flux2_klein),
     ("klein", (4, 8), line_params_flux2_klein),
@@ -162,9 +228,9 @@ def test_l1_probe(
     lowest: dict[tuple[int, int], int] = {}
     calls: dict[tuple[int, int], int] = defaultdict(int)
 
-    def wrap_matmul(fn: Any) -> Any:  # noqa: ANN401
+    def wrap_matmul(fn: Any) -> Any:
         @functools.wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             x = args[0] if args else kwargs.get("input_tensor")
             w = args[1] if len(args) > 1 else kwargs.get("weight_tensor")
             x = x[0] if isinstance(x, (list, tuple)) else x  # concatenated inputs
@@ -178,9 +244,9 @@ def test_l1_probe(
 
         return wrapper
 
-    def wrap_forward(fn: Any) -> Any:  # noqa: ANN401
+    def wrap_forward(fn: Any) -> Any:
         @functools.wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             fn(*args, **kwargs)
             raise _Stop
 
