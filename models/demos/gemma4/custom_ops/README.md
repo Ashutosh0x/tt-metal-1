@@ -138,6 +138,11 @@ halving each chip's bytes. The halves are split inside the kernels, per chip of 
   (`planner.pair_workload_for_core`, `kernels/pair_split.hpp`), every chip holding the whole KV sequence; a row with
   no chunk of a chip's parity writes the finite empty-half statistics (O 0, `m` -30000, `l` 1: merge weight ~0), so
   no host masking is needed.
+* `pair_split=True, split_parts=G, split_axis=a` (`GEMMA4_SDPA_GROUP_SPLIT`, `tt/sdpa_pair_split.py`): the same over
+  the G chips of a line mesh's TP axis that hold one KV head (the 12B on the (1,4) row: G = 4; the 26B-A4B on the
+  (4,1) column: G = 2 over axis 0); device `i` of axis `a` attends part `i % G` = chunks `[ceil(p n / G),
+  ceil((p + 1) n / G))` (the define `SDPA_LSE_SPLIT_PARTS=G`, absent for G = 2, which is the pair split bit for bit)
+  and the model merges the parts by `w_c = 1 / sum_j exp(lse_j - lse_c)` over the gathered LSEs.
 * `half_block=True` (`GEMMA4_KV_PAIR_SHARD`): each chip holds only its half of every 128-token logical block (two
   64-token device pages, chip `c` the page `c % 2`), so the chunk is the device page and the row's `cur_pos` is
   mapped onto the chip's own pages (`kv_pair_shard.half_block_cur_pos`); the read table is the logical table at the

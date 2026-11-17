@@ -14,6 +14,11 @@ program config):
   half (its O and LSE against torch over that half's keys, the empty-half sentinel), the two merged against the
   single full call and torch, the model's device merge (``pair_merge``: the gathered LSEs and the selector) per chip
   and summed, the program-cache repeat;
+* the group split (``GEMMA4_SDPA_GROUP_SPLIT``) on a 4-chip line (``-k "group and 1x4"`` / ``"group and 4x1"``):
+  ``split_parts=4`` on the (1, 4) row (the 12B: one KV head on 4 chips, 16 q heads) and ``split_parts=2`` over axis 0
+  of the (4, 1) column (the 26B-A4B: two KV heads on chip pairs, 8 q heads) at 32K and 86K keys -- each part against
+  torch over its keys, the parts merged against torch (PCC >= 0.999 with fp32 dest) and the single full call, and
+  the model's device merge (``group_merge`` / ``pair_merge`` over the TP axis) summed per group;
 * ``sdpa_prefill_splitk`` (inside the pair-merge cases): the pair-sharded prefill's three-way merge, the served
   causal call against torch and the stock chunked SDPA, and a served-like shape (several Q chunks, the automatic
   split count): the plan covers every (head, q chunk, k chunk) once, the merged statistics' LSE against torch, a
@@ -30,7 +35,8 @@ jobs collect and skip it:
 
 The pair-split cases (``-k 1x2``) open a 2-chip mesh: run them with a 2-chip system mesh (on a Galaxy
 ``MESH_DEVICE=P150x2``, ``TT_MESH_GRAPH_DESC_PATH`` a (1, 2) Blackhole descriptor and ``TT_VISIBLE_DEVICES`` two
-adjacent chips); the others with a single chip (``-k single-chip``).
+adjacent chips); the group cases (``-k group``) a 4-chip line (``MESH_DEVICE=P150x4``, ``TT_VISIBLE_DEVICES`` four
+chips of one line); the others with a single chip (``-k single-chip``).
 """
 
 import math
@@ -50,6 +56,11 @@ SINGLE_CHIP = [pytest.param(1, {"fabric_config": ttnn.FabricConfig.DISABLED}, id
 # the pair: one (1, 2) mesh, fabric as test_factory.parametrize_mesh_with_fabric opens multi-chip meshes (the op
 # itself sends nothing between the chips)
 PAIR_MESH = [pytest.param((1, 2), {"fabric_config": ttnn.FabricConfig.FABRIC_1D}, id="1x2")]
+# the group split: the 4-chip line as the 12B's row and the 26B-A4B's column (the merge gathers over the TP axis)
+GROUP_MESHES = [
+    pytest.param(shape, {"fabric_config": ttnn.FabricConfig.FABRIC_1D}, id=f"{shape[0]}x{shape[1]}")
+    for shape in ((1, 4), (4, 1))
+]
 GATE_ENV = "GEMMA4_SDPA_LSE_TEST"
 BLOCK = 64  # the served vLLM block
 D = 512
@@ -893,5 +904,162 @@ def test_sdpa_decode_lse_pair_split_on_two_chips(mesh_device, device_params, B, 
         assert torch.equal(halves2[h][live], halves[h][live]), f"half {h}: O differs on the repeat"
         ml = [0, P.TILE]  # m and l (the other stats columns are unspecified)
         assert torch.equal(stats2[h][0, live, :Hq][..., ml], stats[h][0, live, :Hq][..., ml]), f"half {h}: stats differ"
+    tt_pos.deallocate(True)
+    tt_tab.deallocate(True)
+
+
+def _group_cases():
+    """(parts, axis, Hq) per line orientation: the 12B (G = 4, 16 q heads) on the row, the 26B-A4B (G = 2 over axis
+    0, 8 q heads) and the 12B on the column; rows at 32K / 86K keys, B = 4 adding a row shorter than one chunk (three
+    of its four parts empty), a half-length row and a skipped row."""
+    out = []
+    for cfg in ("stock", "fp32_dest"):
+        for B, pos in ((1, 32767), (1, 86015), (4, 86015)):
+            for parts, axis, Hq in ((4, 1, 16), (2, 0, 8), (4, 0, 16)):
+                out.append(
+                    pytest.param(parts, axis, Hq, B, pos, cfg, id=f"G{parts}-axis{axis}-Hq{Hq}-B{B}-pos{pos}-{cfg}")
+                )
+    return out
+
+
+@gated
+@pytest.mark.parametrize("parts, axis, Hq, B, pos, cfg", _group_cases())
+@pytest.mark.parametrize("mesh_device, device_params", GROUP_MESHES, indirect=True)
+def test_sdpa_decode_lse_group_split_on_four_chips(
+    mesh_device, device_params, parts, axis, Hq, B, pos, cfg, reset_seeds
+):
+    """``pair_split=True, split_parts=G, split_axis=a`` on a 4-chip line, the same q / caches / page table / cur_pos
+    on every chip: device ``i`` of axis ``a`` attends part ``i % G`` of every row's K chunks (``planner.pair_key_range``
+    with ``parts``). Each part's O and LSE match torch over its keys and an empty part holds the sentinel; the parts
+    of each group merged (``merge_torch`` folded) match torch (PCC >= 0.999 with fp32 dest) and the single full call;
+    the model's device merge over the TP axis (``group_merge`` for G > 2, ``pair_merge`` for G = 2) gives each chip
+    its host term, and each group's terms sum to the full call; the program-cache repeat gives the same bits."""
+    from models.demos.gemma4.config import MeshConfig, ModeConfig
+    from models.demos.gemma4.tt.attention.decode import group_merge, pair_merge
+    from models.demos.gemma4.tt.ccl import CCLManager
+    from models.demos.gemma4.tt.sdpa_pair_split import group_mask, pair_selector
+
+    shape = tuple(int(d) for d in mesh_device.shape)
+    tp = shape[axis]
+    if tp < 4 or shape[1 - axis] != 1:
+        pytest.skip(f"split axis {axis} of mesh {shape} is not the 4-chip line")
+    case = _Case(mesh_device, B, Hq, pos, seed=11)
+    pc, ckc = _program_config(mesh_device), _compute_config(mesh_device, cfg)
+    cur_pos = _pair_positions(B, pos)
+    live = [b for b in range(B) if cur_pos[b] >= 0]
+    tt_pos, tt_tab = case.tensors(cur_pos, case.table)
+    args = (case.tt_q, case.k_cache, case.v_cache, tt_pos, tt_tab)
+    kw = dict(scale=SCALE, program_config=pc, compute_kernel_config=ckc)
+    split = dict(pair_split=True, split_parts=parts, split_axis=axis)
+    assert SdpaDecodeLse.unsupported_reason(*args, **split, **kw) is None
+    logger.info(SdpaDecodeLse.plan(*args, pair_split=True, split_parts=parts, **kw).describe())
+
+    def split_call():
+        out, stats = SdpaDecodeLse.op(*args, memory_config=ttnn.DRAM_MEMORY_CONFIG, **split, **kw)
+        o = [ttnn.to_torch(t)[0, :, :Hq].float() for t in ttnn.get_device_tensors(out)]
+        st = [ttnn.to_torch(t).float() for t in ttnn.get_device_tensors(stats)]
+        out.deallocate(True)
+        stats.deallocate(True)
+        return o, st
+
+    outs, stats = split_call()  # mesh order (row-major) = TP-axis order on a line
+    assert len(outs) == tp
+    lses = [SdpaDecodeLse.lse_from_stats(st, Hq, SCALE)[0] for st in stats]
+    full, lse_full, _ = case.run(cur_pos, case.table, pc, ckc)
+    ref_out, _ = case.golden(cur_pos, case.table)
+
+    m_empty = torch.tensor(P.PAIR_EMPTY_M).to(torch.bfloat16).float().item()
+    for i in range(tp):
+        part = i % parts
+        got, want = [], []
+        for b in live:
+            lo, hi = P.pair_key_range(int(cur_pos[b]), K_CHUNK, part, parts)
+            if lo == hi:
+                assert torch.all(outs[i][b] == 0), f"device {i} row {b}: an empty part's O is not 0"
+                assert torch.all(stats[i][0, b, :Hq, 0] == m_empty), f"device {i} row {b}: m"
+                assert torch.all(stats[i][0, b, :Hq, P.TILE] == P.PAIR_EMPTY_L), f"device {i} row {b}: l"
+                continue
+            o_ref, lse_ref = case.golden_range(b, lo, hi)
+            err = (lses[i][b] - lse_ref).abs().max().item()
+            assert (
+                err <= 0.05 + 0.01 * lse_ref.abs().max().item()
+            ), f"device {i} row {b} keys [{lo}, {hi}): lse off {err}"
+            got.append(outs[i][b])
+            want.append(o_ref)
+        if got:
+            pcc_p = _pcc(torch.stack(got), torch.stack(want))
+            logger.info(
+                f"G={parts} axis={axis} B={B} pos={pos} {cfg}: device {i} (part {part}) pcc(O, torch) {pcc_p:.6f}"
+            )
+            if cfg == "fp32_dest":
+                assert pcc_p > PCC_MIN, f"device {i}: pcc(O, torch) {pcc_p:.5f}"
+
+    # each group's parts merged on the host against the full call and torch
+    weights = []
+    for g in range(tp // parts):
+        members = list(range(g * parts, (g + 1) * parts))
+        merged, lse_m = outs[members[0]], lses[members[0]]
+        for i in members[1:]:
+            merged, lse_m = SdpaDecodeLse.merge_torch(merged, lse_m, outs[i], lses[i])
+        pcc_full = _pcc(merged[live], full[live])
+        pcc_ref = _pcc(merged[live], ref_out[live])
+        pcc_full_ref = _pcc(full[live], ref_out[live])
+        lse_err = (lse_m[live] - lse_full[live]).abs().max().item()
+        logger.info(
+            f"G={parts} axis={axis} B={B} pos={pos} {cfg}: group {g} pcc(merged, full) {pcc_full:.6f}, "
+            f"pcc(merged, torch) {pcc_ref:.6f}, pcc(full, torch) {pcc_full_ref:.6f}, |lse - lse_full| {lse_err:.4f}"
+        )
+        assert pcc_full >= PAIR_PCC_MIN, f"group {g}: merged vs full pcc {pcc_full:.6f}"
+        _assert_merged_vs_torch(cfg, pcc_ref, pcc_full_ref)
+        assert lse_err <= 0.05 + 0.01 * lse_full[live].abs().max().item(), f"group {g}: merged lse off by {lse_err:.4f}"
+        for i in members:  # the exact softmax weight of each part: exp(lse_i - lse_group)
+            weights.append(torch.exp(lses[i] - lse_m)[..., None])
+
+    # the model's device merge over the TP axis: each chip's w * O against the host term, the group sums against the
+    # full call
+    mesh_config = MeshConfig(mesh_device.shape, decode=ModeConfig(tp=tp), tp_axis=axis)
+    per_chip = dict(
+        dtype=ttnn.float32,
+        layout=ttnn.TILE_LAYOUT,
+        device=mesh_device,
+        mesh_mapper=mesh_config.shard_mapper(mesh_device, tensor_dim=1),
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    ccl = CCLManager(mesh_device, num_links=1)
+    out_d, stats_d = SdpaDecodeLse.op(
+        *args, memory_config=ttnn.DRAM_MEMORY_CONFIG, stats_memory_config=ttnn.DRAM_MEMORY_CONFIG, **split, **kw
+    )
+    if parts == 2:
+        selector = ttnn.from_torch(pair_selector(tp), **per_chip)
+        w_out = pair_merge(out_d, stats_d, selector, mesh_config, ccl, scale=SCALE)
+    else:
+        selector = ttnn.from_torch(group_mask(tp, parts), **per_chip) if parts < tp else None
+        w_out = group_merge(out_d, stats_d, selector, mesh_config, ccl, scale=SCALE)
+    terms = [ttnn.to_torch(t)[0, :, :Hq].float() for t in ttnn.get_device_tensors(w_out)]
+    for i in range(tp):
+        pcc_t = _pcc(terms[i][live], (weights[i] * outs[i])[live])
+        assert pcc_t >= PCC_MIN, f"device {i}: device merge term vs host pcc {pcc_t:.6f}"
+    for g in range(tp // parts):
+        summed = sum(terms[i] for i in range(g * parts, (g + 1) * parts))
+        pcc_dev = _pcc(summed[live], full[live])
+        pcc_dev_ref = _pcc(summed[live], ref_out[live])
+        logger.info(
+            f"G={parts} axis={axis} B={B} pos={pos} {cfg}: group {g} device merge summed vs full pcc {pcc_dev:.6f}, "
+            f"vs torch {pcc_dev_ref:.6f}"
+        )
+        assert pcc_dev >= PCC_MIN, f"group {g}: device merge vs full pcc {pcc_dev:.6f}"
+        if cfg == "fp32_dest":
+            assert pcc_dev_ref >= PCC_MIN, f"group {g}: device merge vs torch pcc {pcc_dev_ref:.6f}"
+    w_out.deallocate(True)
+    if selector is not None:
+        selector.deallocate(True)
+
+    outs2, stats2 = split_call()
+    for i in range(tp):
+        assert torch.equal(outs2[i][live], outs[i][live]), f"device {i}: O differs on the repeat"
+        ml = [0, P.TILE]
+        assert torch.equal(
+            stats2[i][0, live, :Hq][..., ml], stats[i][0, live, :Hq][..., ml]
+        ), f"device {i}: stats differ"
     tt_pos.deallocate(True)
     tt_tab.deallocate(True)

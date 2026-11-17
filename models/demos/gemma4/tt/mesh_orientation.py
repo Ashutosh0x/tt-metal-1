@@ -169,6 +169,11 @@ SDPA_SPLITFREE_ENV = "GEMMA4_SDPA_DECODE_SPLITFREE"
 # line), off in every other profile; it is read at the weight build (the pair QKV / o_proj copies) and at the decode
 # call, both through decode_flag.
 SDPA_PAIR_SPLIT_ENV = "GEMMA4_SDPA_PAIR_SPLIT"
+# GEMMA4_SDPA_GROUP_SPLIT: the same split over the G = TP / Hkv chips holding each global KV head on a 4-chip line
+# (tt/sdpa_pair_split.py: the 12B's one KV head on all 4 chips of the (1,4) row, G = 4; the 26B-A4B's two on the chip
+# pairs of the (4,1) column, G = 2). Off in every profile until a served A/B qualifies it; read at the weight build
+# (the group QKV / o_proj copies) and at the decode call, both through decode_flag.
+SDPA_GROUP_SPLIT_ENV = "GEMMA4_SDPA_GROUP_SPLIT"
 # GEMMA4_SPEC_VERIFY_PREFIX_LSE: the serving verify's global layers attend the committed prefix once per row through
 # custom_ops/sdpa_decode_lse (pair-split on a pair build) plus the candidates' own keys, merged by their LSE
 # (tt/verify_prefix_lse.py), instead of the rung-wide masked packed attention.
@@ -180,6 +185,7 @@ DECODE_FUSION_OFF = {
         **DENSE_DECODE_FUSION_ON,
         SDPA_SPLITFREE_ENV: "0",
         SDPA_PAIR_SPLIT_ENV: "0",
+        SDPA_GROUP_SPLIT_ENV: "0",
         VERIFY_PREFIX_LSE_ENV: "0",
     }
 }

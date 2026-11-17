@@ -40,6 +40,11 @@ chunks split as half 0 = ``[0, ceil(n / 2))``, half 1 = ``[ceil(n / 2), n)``; wi
 ``cores_per_head`` cores take the stock reversed split (``pair_workload_for_core``, the mirror of
 ``kernels/pair_split.hpp``), so the core plan, the tree and every runtime arg are the same on both halves. Without
 ``pair_split`` the plan, the arguments and the preprocessed kernels are the stock ones above.
+
+Group split (``plan(..., pair_split=True, split_parts=G)``, G > 2; ``GEMMA4_SDPA_GROUP_SPLIT``): the same over G
+parts -- part ``p`` = ``[ceil(p * n / G), ceil((p + 1) * n / G))`` of the row's chunks (G = 2 is the pair's split
+exactly), the device's part its index along the split axis mod G -- with one more define,
+``SDPA_LSE_SPLIT_PARTS=G``, on every kernel. G = 2 adds no define: the pair plan stays the one above.
 """
 
 import dataclasses
@@ -64,6 +69,8 @@ PAIR_EMPTY_M = -30000.0
 PAIR_EMPTY_L = 1.0
 PAIR_EMPTY_M_PACKED = 0xC6EAC6EA  # bf16(-30000) = 0xC6EA, twice
 PAIR_EMPTY_L_PACKED = 0x3F803F80  # bf16(1.0) = 0x3F80, twice
+# group split: the number of parts (kernels/pair_split.hpp reads it; absent = 2, the pair)
+SPLIT_PARTS_DEFINE = "SDPA_LSE_SPLIT_PARTS"
 
 # CB indices of the stock kernels (sdpa_flash_decode.cpp / reader_decode_all.cpp / writer_decode_all.cpp)
 CB_Q, CB_K, CB_V, CB_MASK, CB_SCALE, CB_M_IN, CB_L_IN = 0, 1, 2, 3, 5, 6, 7
@@ -158,9 +165,10 @@ def workload_for_core(cur_pos, core_num, cores, k_chunk_size):
 
 
 # ── pair split ───────────────────────────────────────────────────────────────────────────────────────────────────
-def pair_half_of(col):
-    """The pair half of the device in mesh column ``col``: its parity (the pair is columns ``(c, c ^ 1)``)."""
-    return int(col) % 2
+def pair_half_of(col, parts=2):
+    """The pair half of the device in mesh column ``col``: its parity (the pair is columns ``(c, c ^ 1)``). Under the
+    group split (``parts`` = G) the part of the device at index ``col`` along the split axis: ``col % G``."""
+    return int(col) % int(parts)
 
 
 def pair_partner(coord):
@@ -185,22 +193,47 @@ def pair_split_reason(mesh_shape):
     return None
 
 
-def pair_half_chunks(num_chunks, half):
+def split_reason(mesh_shape, parts=2, axis=1):
+    """None when a mesh of ``mesh_shape`` can run the split of every row's keys over ``parts`` devices along mesh
+    axis ``axis`` (the part of a device = its index on that axis mod ``parts``), else why not. The pair (2 parts over
+    the columns) is ``pair_split_reason``."""
+    parts, axis = int(parts), int(axis)
+    if parts == 2 and axis == 1:
+        return pair_split_reason(mesh_shape)
+    if mesh_shape is None:
+        return "the group split needs a mesh device (a single device has no group partner)"
+    dims = tuple(int(d) for d in mesh_shape)
+    if len(dims) != 2:
+        return f"the group split needs a 2-D (rows, cols) mesh, got shape {dims}"
+    if axis not in (0, 1):
+        return f"the group split runs along mesh axis 0 or 1, got {axis}"
+    if parts < 2:
+        return f"the group split needs at least 2 parts, got {parts}"
+    if dims[axis] % parts:
+        return f"the group split takes {parts} devices of mesh axis {axis}: the mesh {dims} has {dims[axis]}"
+    return None
+
+
+def pair_half_chunks(num_chunks, half, parts=2):
     """``(first chunk, chunk count)`` of half ``half`` of a row's ``num_chunks`` K chunks: half 0 = ``[0, ceil(n /
-    2))``, half 1 = ``[ceil(n / 2), n)`` (empty for a one-chunk row)."""
-    n, first = int(num_chunks), (int(num_chunks) + 1) // 2
-    return (0, first) if int(half) == 0 else (first, n - first)
+    2))``, half 1 = ``[ceil(n / 2), n)`` (empty for a one-chunk row). Under the group split (``parts`` = G) part
+    ``p`` = ``[ceil(p * n / G), ceil((p + 1) * n / G))`` (G = 2: the halves above); a row with fewer chunks than parts
+    leaves some parts empty."""
+    n, parts, half = int(num_chunks), int(parts), int(half)
+    first = (half * n + parts - 1) // parts
+    return first, ((half + 1) * n + parts - 1) // parts - first
 
 
-def pair_workload_for_core(cur_pos, core_num, cores, k_chunk_size, half):
+def pair_workload_for_core(cur_pos, core_num, cores, k_chunk_size, half, parts=2):
     """Mirror of ``kernels/pair_split.hpp`` ``get_pair_workload_for_core``: ``(PSt, num_chunks, chunk_start,
     chunk_end, half_chunks)`` of member ``core_num`` of a ``cores``-member group on the device holding half ``half``
-    of a row at ``cur_pos``. PSt and num_chunks are the whole row's; within the half the stock reversed split (member
-    0 takes the half's last chunks, member c has data iff ``c < half_chunks``)."""
+    (part ``half`` of ``parts`` under the group split) of a row at ``cur_pos``. PSt and num_chunks are the whole row's;
+    within the half the stock reversed split (member 0 takes the half's last chunks, member c has data iff
+    ``c < half_chunks``)."""
     cur_pos, core_num, cores, k = int(cur_pos), int(core_num), int(cores), int(k_chunk_size)
     valid = ((cur_pos + 1 + k - 1) // k) * k
     num_chunks = valid // k
-    base, cnt = pair_half_chunks(num_chunks, half)
+    base, cnt = pair_half_chunks(num_chunks, half, parts)
     if cores > cnt:
         start = end = base
         if core_num < cnt:
@@ -214,14 +247,14 @@ def pair_workload_for_core(cur_pos, core_num, cores, k_chunk_size, half):
     return valid // TILE, num_chunks, start, end, cnt
 
 
-def pair_key_range(cur_pos, k_chunk_size, half):
-    """The keys ``[lo, hi)`` half ``half`` of a row at ``cur_pos`` attends (``(0, 0)`` for a skipped row, ``lo == hi``
-    for an empty half): its chunks clipped to ``cur_pos + 1``."""
+def pair_key_range(cur_pos, k_chunk_size, half, parts=2):
+    """The keys ``[lo, hi)`` half ``half`` (part ``half`` of ``parts``) of a row at ``cur_pos`` attends (``(0, 0)`` for
+    a skipped row, ``lo == hi`` for an empty half): its chunks clipped to ``cur_pos + 1``."""
     if int(cur_pos) < 0:
         return 0, 0
     k = int(k_chunk_size)
     n = -(-(int(cur_pos) + 1) // k)
-    base, cnt = pair_half_chunks(n, half)
+    base, cnt = pair_half_chunks(n, half, parts)
     end = min((base + cnt) * k, int(cur_pos) + 1)
     return min(base * k, end), end
 
@@ -683,6 +716,16 @@ def runtime_args(g, plan, phys, addrs):
     return out
 
 
+def split_defines(pair_split, split_parts=2):
+    """The defines every kernel of a split plan carries: PAIR_SPLIT_DEFINE, plus ``SDPA_LSE_SPLIT_PARTS=G`` under the
+    group split (G > 2); none without pair_split (the stock)."""
+    if not pair_split:
+        return ()
+    if int(split_parts) == 2:
+        return (PAIR_SPLIT_DEFINE,)
+    return (PAIR_SPLIT_DEFINE, (SPLIT_PARTS_DEFINE, str(int(split_parts))))
+
+
 @dataclasses.dataclass(frozen=True)
 class LsePlan:
     """Everything the op builds a program from, minus the ttnn objects."""
@@ -695,20 +738,22 @@ class LsePlan:
     compute_ct: tuple
     defines: tuple  # the compute kernel's (with PAIR_SPLIT_DEFINE under pair_split)
     pair_split: bool = False
+    split_parts: int = 2  # the group split's G (2: the pair)
 
     @property
     def dataflow_defines(self):
-        """The reader's and the writer's defines: PAIR_SPLIT_DEFINE under pair_split, else none (the stock)."""
-        return (PAIR_SPLIT_DEFINE,) if self.pair_split else ()
+        """The reader's and the writer's defines: PAIR_SPLIT_DEFINE under pair_split (and the parts under the group
+        split), else none (the stock)."""
+        return split_defines(self.pair_split, self.split_parts)
 
     def pair_ct(self, half):
-        """The compile-time args every kernel appends on the device holding pair half ``half`` (none without
-        pair_split): the reader / writer after their last TensorAccessorArgs block, the compute at index
-        ``COMPUTE_CT_ARGS``."""
+        """The compile-time args every kernel appends on the device holding pair half ``half`` (part ``half`` of
+        ``split_parts``; none without pair_split): the reader / writer after their last TensorAccessorArgs block, the
+        compute at index ``COMPUTE_CT_ARGS``."""
         if not self.pair_split:
             return ()
-        if int(half) not in (0, 1):
-            raise ValueError(f"pair half {half} is not 0 or 1")
+        if not 0 <= int(half) < int(self.split_parts):
+            raise ValueError(f"pair half {half} is not in 0..{int(self.split_parts) - 1}")
         return (int(half),)
 
     @property
@@ -721,14 +766,21 @@ class LsePlan:
             f"B={g.batch} Hq={g.num_q_heads} D={g.head_dim} S={g.st * TILE} block={g.block_size} "
             f"k_chunk={g.k_chunk_size} kv={g.kv_dtype} grid={c.grid[0]}x{c.grid[1]} cores/head={c.cores_per_head} "
             f"active={c.active_cores} rounds={c.rounds} half_tile={g.use_half_tile} dst={g.dst_size} "
-            f"CB={self.cb_total_bytes} B" + (" pair_split" if self.pair_split else "")
+            f"CB={self.cb_total_bytes} B"
+            + (
+                (" pair_split" if self.split_parts == 2 else f" group_split/{self.split_parts}")
+                if self.pair_split
+                else ""
+            )
         )
 
 
-def plan(g, grid, max_cores_per_head_batch, pair_split=False):
-    """The full host plan of one call (``pair_split``: the per-device plan of the pair split, see the module
-    docstring). Raises ValueError out of contract."""
+def plan(g, grid, max_cores_per_head_batch, pair_split=False, split_parts=2):
+    """The full host plan of one call (``pair_split``: the per-device plan of the pair split, ``split_parts`` = G > 2
+    the group split's, see the module docstring). Raises ValueError out of contract."""
     g.check()
+    if int(split_parts) < 2:
+        raise ValueError(f"split_parts {split_parts} < 2")
     cores = plan_cores(grid, g.batch, max_cores_per_head_batch)
     mm = matmul_config(g)
     return LsePlan(
@@ -738,8 +790,9 @@ def plan(g, grid, max_cores_per_head_batch, pair_split=False):
         reader_ct=tuple(reader_ct(g, cores)),
         writer_ct=tuple(writer_ct(g, cores)),
         compute_ct=tuple(compute_ct(g, cores)),
-        defines=tuple(mm["defines"]) + ((PAIR_SPLIT_DEFINE,) if pair_split else ()),
+        defines=tuple(mm["defines"]) + split_defines(pair_split, split_parts),
         pair_split=bool(pair_split),
+        split_parts=int(split_parts),
     )
 
 

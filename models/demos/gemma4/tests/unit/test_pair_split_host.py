@@ -285,3 +285,162 @@ def test_knob_is_registered_and_off_by_default(monkeypatch):
         assert ps.pair_split_enabled()
     finally:
         mo.clear_decode_fusion_profile()
+
+
+# ── GEMMA4_SDPA_GROUP_SPLIT: G = tp / Hkv chips per KV head on a line mesh ───────────────────────────────────────────
+# (nq, nkv, tp): the 12B on the (1,4) row (one global KV head, G = 4), the 26B-A4B on the (4,1) column (two, G = 2),
+# a 4-way split with two groups (G = 4 on 8 chips: the group mask is not all ones)
+GROUP_SHAPES = [(16, 1, 4), (16, 2, 4), (16, 2, 8)]
+
+
+def _group_keys(pos, part, parts):
+    """Keys 0..pos in CHUNK-key chunks, part ``p`` of ``parts`` = chunks [ceil(p n / G), ceil((p + 1) n / G))."""
+    n = (pos + 1 + CHUNK - 1) // CHUNK
+    lo, hi = (part * n + parts - 1) // parts, ((part + 1) * n + parts - 1) // parts
+    return list(range(lo * CHUNK, min(hi * CHUNK, pos + 1)))
+
+
+def _group_case(nq, nkv, seed):
+    hidden = 48
+    q_w = _rand(nq * D, hidden, seed=seed) / math.sqrt(hidden)
+    k_w = _rand(nkv * D, hidden, seed=seed + 1) / math.sqrt(hidden)
+    o_w = _rand(hidden, nq * D, seed=seed + 2) / math.sqrt(nq * D)
+    x = _rand(len(CUR_POS), hidden, seed=seed + 3)
+    cache = _rand(len(CUR_POS), nkv, S, D, seed=seed + 4)
+    return q_w, k_w, o_w, x, cache
+
+
+@pytest.mark.parametrize("nq, nkv, tp", GROUP_SHAPES, ids=lambda v: str(v))
+@pytest.mark.parametrize("scale", (1.0, 0.25))
+def test_group_layout_sums_to_full_attention(nq, nkv, tp, scale):
+    """Through the production helpers: device i holds the pair / group QKV and o_proj blocks of KV group i // G
+    (``pair_qkv_weight`` / ``pair_o_proj_weight``, G = tp / nkv), attends part i % G of every row's keys, merges by
+    ``pair_merge_reference`` (G = 2) or ``group_merge_reference`` (G > 2), and the sum over the TP axis of the merged
+    terms through its o_proj rows is the full attention @ o_proj; every chip of a group writes the same K / V."""
+    parts, reason = ps.group_split_parts(
+        is_sliding=False, num_q_heads=nq, num_kv_heads=nkv, tp=tp, mesh_shape=(1, tp), kv_replicated=True
+    )
+    assert reason is None and parts == tp // nkv
+    q_w, k_w, o_w, x, cache = _group_case(nq, nkv, seed=31)
+    group = nq // nkv
+    B = len(CUR_POS)
+    ref = torch.zeros(B, nq * D)
+    for b, pos in enumerate(CUR_POS):
+        for g in range(nkv):
+            kv = _with_new_token(cache, b, g, x[b] @ k_w[g * D : (g + 1) * D].T, pos)
+            for h in range(g * group, (g + 1) * group):
+                s = (x[b] @ q_w[h * D : (h + 1) * D].T) @ kv[: pos + 1].T * scale
+                ref[b, h * D : (h + 1) * D] = torch.softmax(s, -1) @ kv[: pos + 1]
+    ref = ref @ o_w.T
+    kw = dict(num_q_heads=nq, num_kv_heads=nkv, head_dim=D, tp=tp)
+    wqkv = ps.pair_qkv_weight(q_w, k_w, k_w, **kw)
+    wo = ps.pair_o_proj_weight(o_w.T, **kw)
+    width = (group + 2) * D
+    assert wqkv.shape == (q_w.shape[1], tp * width) and wo.shape == (tp * group * D, o_w.shape[0])
+    out, m, l = torch.zeros(tp, B, group, D), torch.zeros(tp, B, group), torch.zeros(tp, B, group)
+    k_rows = torch.zeros(tp, B, D)
+    for i in range(tp):
+        proj = x @ wqkv[:, i * width : (i + 1) * width]
+        q, k_new = proj[:, : group * D], proj[:, group * D : (group + 1) * D]
+        k_rows[i] = k_new
+        for b, pos in enumerate(CUR_POS):
+            kv = _with_new_token(cache, b, i // parts, k_new[b], pos)
+            keys = _group_keys(pos, i % parts, parts)
+            out[i, b], m[i, b], l[i, b] = _attend(q[b].reshape(group, D), kv, keys, scale)
+    if parts == 2:
+        merged = ps.pair_merge_reference(out, m, l, scale=scale)
+    else:
+        merged = ps.group_merge_reference(out, m, l, parts=parts, scale=scale)
+    assert torch.isfinite(merged).all()
+    y = sum(merged[i].reshape(B, group * D) @ wo[i * group * D : (i + 1) * group * D] for i in range(tp))
+    torch.testing.assert_close(y, ref, rtol=1e-4, atol=1e-5)
+    for i in range(tp):
+        g = i // parts
+        torch.testing.assert_close(k_rows[i], x @ k_w[g * D : (g + 1) * D].T, rtol=1e-5, atol=1e-6)
+        assert (i * (nq // tp)) * nkv // nq == g  # the 4-head layout's KV head on device i: the same group
+
+
+def test_group_parts_cover_the_row_and_keep_the_pair():
+    """Part p of G takes chunks [ceil(p n / G), ceil((p + 1) n / G)): the parts tile the row (some empty when n < G)
+    and G = 2 is the pair's halves exactly."""
+    for n in range(0, 40):
+        for parts in (2, 3, 4, 8):
+            keys = [k for p in range(parts) for k in _group_keys(n * CHUNK - 1, p, parts)] if n else []
+            assert keys == list(range(n * CHUNK)), (n, parts)
+        for half in (0, 1):
+            assert _group_keys(n * CHUNK + 3, half, 2) == _half_keys(n * CHUNK + 3, half)
+
+
+@pytest.mark.parametrize("empty", ([1, 2, 3], [0, 2], [3]))
+def test_group_merge_with_empty_parts(empty):
+    """Empty parts (O = 0, m = -30000, l = 1) weigh ~0 (1e-28: the clamp) and the live parts merge as the
+    logsumexp merge; nothing overflows."""
+    parts, B, H = 4, 3, 16
+    out = _rand(parts, B, H, D, seed=41)
+    m = _rand(parts, B, H, seed=42) * 20.0
+    l = 1.0 + _rand(parts, B, H, seed=43).abs() * 100.0
+    for e in empty:
+        out[e], m[e], l[e] = 0.0, ps.EMPTY_HALF_M, 1.0
+    merged = ps.group_merge_reference(out, m, l, parts=parts, scale=1.0)
+    assert torch.isfinite(merged).all()
+    live = [p for p in range(parts) if p not in empty]
+    lse = ps.lse_from_m_l(m, l, 1.0)[live]
+    w = torch.softmax(lse, dim=0)
+    expect = (w[..., None] * out[live]).sum(0)
+    torch.testing.assert_close(merged.sum(0), expect, rtol=1e-5, atol=1e-6)
+    for e in empty:
+        assert torch.equal(merged[e], torch.zeros(B, H, D))
+
+
+@pytest.mark.parametrize("tp, parts", [(4, 4), (8, 4), (8, 2), (4, 2)])
+def test_group_mask_rows(tp, parts):
+    """Device c's shard of ``group_mask`` (dim 1 split in tp) is 1 on the devices of its group c // parts."""
+    mask = ps.group_mask(tp, parts)
+    assert mask.shape == (1, tp * tp, 1, 1) and mask.dtype == torch.float32
+    for c, shard in enumerate(torch.chunk(mask, tp, dim=1)):
+        row = shard.reshape(tp)
+        assert row.tolist() == [1.0 if j // parts == c // parts else 0.0 for j in range(tp)]
+
+
+def test_group_layers_that_qualify():
+    """The 12B on the (1,4) row (G = 4) and the 26B-A4B on the (4,1) column (TP over axis 0, G = 2) qualify, as does
+    the 31B on the (1,8) row (G = 2); sliding layers, 2-D meshes, TP off the line's axis, split KV heads and heads
+    that do not nest do not."""
+    b12 = dict(is_sliding=False, num_q_heads=16, num_kv_heads=1, tp=4, mesh_shape=(1, 4), kv_replicated=True)
+    assert ps.group_split_parts(**b12) == (4, None)
+    assert ps.group_split_parts(**{**b12, "mesh_shape": (4, 1), "tp_axis": 0}) == (4, None)
+    b26 = dict(b12, num_kv_heads=2, mesh_shape=(4, 1), tp_axis=0)
+    assert ps.group_split_parts(**b26) == (2, None)
+    assert ps.group_split_parts(
+        num_q_heads=32, num_kv_heads=4, tp=8, mesh_shape=(1, 8), is_sliding=False, kv_replicated=True
+    ) == (2, None)
+    assert ps.group_split_parts(**{**b12, "is_sliding": True}) == (0, "sliding layer")
+    assert "line" in ps.group_split_parts(**{**b12, "mesh_shape": (2, 4), "tp": 4})[1]
+    assert "line" in ps.group_split_parts(**{**b12, "mesh_shape": (1, 1), "tp": 1})[1]
+    assert "TP" in ps.group_split_parts(**{**b26, "tp_axis": 1})[1]
+    assert "fracture" in ps.group_split_parts(**{**b12, "fractured": True})[1]
+    assert "replicated" in ps.group_split_parts(**{**b12, "num_kv_heads": 4, "kv_replicated": False})[1]
+    assert "nest" in ps.group_split_parts(**{**b12, "num_kv_heads": 3})[1]
+    assert ps.group_split_mesh((1, 4)) and ps.group_split_mesh((4, 1)) and ps.group_split_mesh((1, 8))
+    assert not ps.group_split_mesh((2, 4)) and not ps.group_split_mesh((1, 1)) and not ps.group_split_mesh(None)
+
+
+def test_group_knob_is_registered_and_off_by_default(monkeypatch):
+    """GEMMA4_SDPA_GROUP_SPLIT sits in the decode-flag registry and is off under every build profile (the env turns
+    it on)."""
+    assert ps.GROUP_SPLIT_ENV == mo.SDPA_GROUP_SPLIT_ENV == "GEMMA4_SDPA_GROUP_SPLIT"
+    assert mo.DECODE_FUSION_OFF[ps.GROUP_SPLIT_ENV] == "0"
+    monkeypatch.delenv(ps.GROUP_SPLIT_ENV, raising=False)
+    try:
+        for shape, moe, pairs in (
+            ((1, 4), False, False),
+            ((4, 1), True, False),
+            ((1, 8), False, True),
+            ((8, 4), True, False),
+        ):
+            mo.set_decode_fusion_profile(shape, blackhole=True, moe=moe, kv_pairs=pairs)
+            assert not ps.group_split_enabled()
+        monkeypatch.setenv(ps.GROUP_SPLIT_ENV, "1")
+        assert ps.group_split_enabled()
+    finally:
+        mo.clear_decode_fusion_profile()

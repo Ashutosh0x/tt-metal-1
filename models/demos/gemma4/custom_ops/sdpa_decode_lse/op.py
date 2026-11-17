@@ -54,6 +54,15 @@ whole row (``planner.pair_workload_for_core``), so each chip reads half the row'
 ``unsupported_reason(..., pair_split=True)`` refuses a device that is not a mesh, a single-device mesh and an odd
 number of mesh columns.
 
+Group split (``pair_split=True, split_parts=G, split_axis=a``; ``GEMMA4_SDPA_GROUP_SPLIT``: the 12B's one global KV
+head on all 4 chips of a (1, 4) row, G = 4; the 26B-A4B's two on chip pairs of a (4, 1) column, G = 2 over axis 0):
+the device at index ``i`` along mesh axis ``a`` runs part ``p = i % G`` of every row's K chunks, part ``p`` =
+``[ceil(p * n / G), ceil((p + 1) * n / G))`` (G = 2 over the columns is the pair split above, bit for bit), with the
+same per-part outputs (``out`` normalised over the part's keys, its m / l, the sentinel for an empty part -- a row
+with fewer chunks than parts leaves some parts empty). The merge over the G parts is ``O = sum_c w_c O_c`` with
+``w_c = exp(lse_c - logsumexp_j lse_j)`` (``merge_torch`` folded over the parts). ``unsupported_reason`` refuses a
+mesh whose axis ``a`` does not hold a multiple of G devices.
+
 Contract (``unsupported_reason`` refuses the rest with the reason; the caller keeps the stock op):
 ``q [1, B, Hq <= 32, D]`` bf16 TILE interleaved (DRAM or L1; a height-sharded q must be moved to DRAM first, as
 the splitfree call site does), ``D`` in {256, 512}; ``k_cache / v_cache [blocks, nkv, block, Dk]`` bf16 or
@@ -210,9 +219,10 @@ class SdpaDecodeLse:
         program_config=None,
         compute_kernel_config=None,
         pair_split=False,
+        split_parts=2,
     ):
-        """The host plan (``planner.LsePlan``, per device under ``pair_split``) of a call; ValueError when the shapes
-        leave the contract."""
+        """The host plan (``planner.LsePlan``, per device under ``pair_split``; ``split_parts`` = G of the group
+        split) of a call; ValueError when the shapes leave the contract."""
         device = q.device()
         _, B, Hq, D = _shape(q)
         grid, k_chunk, max_cph, exp_approx = cls._program_knobs(device, program_config)
@@ -234,7 +244,7 @@ class SdpaDecodeLse:
             fp32_dest_acc_en=fp32_dest,
             exp_approx_mode=exp_approx,
         )
-        return P.plan(g, grid, max_cph, pair_split=bool(pair_split))
+        return P.plan(g, grid, max_cph, pair_split=bool(pair_split), split_parts=int(split_parts))
 
     @classmethod
     def unsupported_reason(
@@ -255,11 +265,15 @@ class SdpaDecodeLse:
         memory_config=None,
         pair_split=False,
         half_block=False,
+        split_parts=2,
+        split_axis=1,
     ):
         """None when the call is in contract (shapes, formats, layouts, the plan and its L1 fit; under ``pair_split``
-        or ``half_block`` a mesh with an even number of columns), else why."""
+        or ``half_block`` a mesh with an even number of columns -- under the group split a mesh whose ``split_axis``
+        holds a multiple of ``split_parts`` devices), else why."""
         if pair_split or half_block:
-            reason = P.pair_split_reason(_mesh_shape(q.device()))
+            parts, axis = (int(split_parts), int(split_axis)) if pair_split else (2, 1)
+            reason = P.split_reason(_mesh_shape(q.device()), parts, axis)
             if reason is not None:
                 return reason
         if q.layout != ttnn.TILE_LAYOUT or q.dtype != ttnn.bfloat16:
@@ -325,6 +339,7 @@ class SdpaDecodeLse:
                 program_config=program_config,
                 compute_kernel_config=compute_kernel_config,
                 pair_split=pair_split,
+                split_parts=split_parts if pair_split else 2,
             )
         except ValueError as e:
             return str(e)
@@ -360,19 +375,27 @@ class SdpaDecodeLse:
         owned=False,
         half_block=False,
         half=None,
+        split_parts=2,
+        split_axis=1,
     ):
         """Paged causal decode attention + row statistics. Returns ``(out [1, B, Hq, D] bf16 TILE, stats
         [1, B, PNH, 64] bf16 TILE)``; see the module docstring for the stats layout and the LSE convention.
         ``pair_split``: each device attends only its pair half of every row's keys (module docstring), one program
         per mesh coordinate. ``owned`` (pair-sharded global KV, ``tt/kv_pair_shard.py``): the stock single
         program over each device's own compacted ``page_table`` and ``cur_pos``; a ``cur_pos = -1`` row writes
-        the empty-half sentinel (O = 0, m = -30000, l = 1) instead of being skipped. Exclusive with pair_split."""
+        the empty-half sentinel (O = 0, m = -30000, l = 1) instead of being skipped. Exclusive with pair_split.
+        ``split_parts`` / ``split_axis`` (with ``pair_split``): the group split -- the device at index ``i`` along mesh
+        axis ``split_axis`` attends part ``i % split_parts`` of every row's keys (module docstring); 2 / 1 is the
+        pair."""
         assert not (pair_split and owned), "sdpa_decode_lse: owned and pair_split are exclusive"
         # half_block (pair-sharded global KV, the half-block layout): each device of a pair holds the block_size-token
         # half ``h`` (its column's parity, or ``half`` on every device -- a single-chip test) of every logical
         # block in the slot the page table names; the kernels derive the effective cur_pos from the global one and
         # the writer writes the empty-half sentinel when a device owns none of a row's keys.
         assert not (half_block and (pair_split or owned)), "sdpa_decode_lse: half_block is its own mode"
+        split_parts, split_axis = int(split_parts), int(split_axis)
+        group = (split_parts, split_axis) != (2, 1)
+        assert pair_split or not group, "sdpa_decode_lse: split_parts / split_axis need pair_split"
         kw = dict(
             scale=scale,
             num_kv_heads=num_kv_heads,
@@ -381,10 +404,11 @@ class SdpaDecodeLse:
             program_config=program_config,
             compute_kernel_config=compute_kernel_config,
             pair_split=bool(pair_split),
+            split_parts=split_parts,
         )
         # a half-block call that leaves the column parity to the mesh (half None) runs one program per parity: the
         # pair split's mesh rule (a one-row mesh with even columns) applies to it as well
-        check = dict(kw, pair_split=bool(pair_split) or (bool(half_block) and half is None))
+        check = dict(kw, pair_split=bool(pair_split) or (bool(half_block) and half is None), split_axis=split_axis)
         reason = cls.unsupported_reason(q, k_cache, v_cache, cur_pos, page_table, memory_config=memory_config, **check)
         assert reason is None, f"sdpa_decode_lse: {reason}"
         plan = cls.plan(q, k_cache, v_cache, cur_pos, page_table, **kw)
@@ -508,16 +532,19 @@ class SdpaDecodeLse:
         if half_block and half is not None:
             programs = program(int(half))
         elif plan.pair_split or half_block:
-            # one program per mesh coordinate, the half = the column's parity (the pair is columns (c, c ^ 1));
-            # generic_op hashes each coordinate range with its program, compile-time args included. The two
-            # half programs are built once: MeshProgramDescriptor stores a copy per coordinate.
+            # one program per mesh coordinate, the half = the column's parity (the pair is columns (c, c ^ 1); the
+            # group split: the part = the index along split_axis mod split_parts); generic_op hashes each coordinate
+            # range with its program, compile-time args included. The part programs are built once:
+            # MeshProgramDescriptor stores a copy per coordinate.
             rows, cols = _mesh_shape(device)
-            by_half = {h: program(h) for h in (0, 1)}
+            parts = plan.split_parts if plan.pair_split else 2
+            by_half = {h: program(h) for h in range(parts)}
             programs = ttnn.MeshProgramDescriptor()
             for r in range(rows):
                 for c in range(cols):
                     coord = ttnn.MeshCoordinate(r, c)
-                    programs[ttnn.MeshCoordinateRange(coord, coord)] = by_half[P.pair_half_of(c)]
+                    index = r if (plan.pair_split and split_axis == 0) else c
+                    programs[ttnn.MeshCoordinateRange(coord, coord)] = by_half[P.pair_half_of(index, parts)]
         else:
             programs = program()
         out = ttnn.generic_op([q, k_cache, v_cache, cur_pos, page_table, stats, out], programs)

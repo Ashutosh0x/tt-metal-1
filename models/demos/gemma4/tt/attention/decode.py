@@ -30,7 +30,15 @@ from models.demos.gemma4.tt.ccl import ccl_allgather, oneshot_matmul_kwargs
 from models.demos.gemma4.tt.compute_config import sdpa_fp32_dest_acc_en, sdpa_math_fidelity
 from models.demos.gemma4.tt.kv_pair_shard import KV_PAIR_SHARD_ENV, kv_pair_shard_enabled
 from models.demos.gemma4.tt.mesh_orientation import decode_flag
-from models.demos.gemma4.tt.sdpa_pair_split import LOGIT_CLAMP, STATS_L_COL, STATS_M_COL, log_once, pair_split_enabled
+from models.demos.gemma4.tt.sdpa_pair_split import (
+    GROUP_SPLIT_ENV,
+    LOGIT_CLAMP,
+    STATS_L_COL,
+    STATS_M_COL,
+    group_split_enabled,
+    log_once,
+    pair_split_enabled,
+)
 from models.demos.gemma4.tt.verify_multipos import TILE as MULTIPOS_TILE
 from models.demos.gemma4.tt.verify_multipos import log_once as multipos_log_once
 from models.demos.gemma4.tt.verify_multipos import multipos_layer_reason
@@ -354,8 +362,37 @@ def pair_split_active(weights, page_table, kv_cache, is_kv_shared, sequential_kv
     return True
 
 
+def group_split_active(weights, page_table, kv_cache, is_kv_shared, sequential_kv_write) -> bool:
+    """Whether a decode call runs on the group view ``weights.group`` (``GEMMA4_SDPA_GROUP_SPLIT``): built for the
+    layer and a plain paged decode step. The speculative verify (``sequential_kv_write``), KV-shared layers and a
+    non-paged cache keep the 4-head path (logged once per reason); static arguments only (trace-safe)."""
+    if weights.group is None or not group_split_enabled():
+        return False
+    reason = None
+    if page_table is None or kv_cache is None:
+        reason = "no paged KV cache"
+    elif is_kv_shared:
+        reason = "KV-shared layer"
+    elif sequential_kv_write:
+        reason = "speculative verify (per-candidate KV write)"
+    if reason is not None:
+        log_once(f"a decode call keeps the 4-head attention: {reason}", GROUP_SPLIT_ENV)
+        return False
+    return True
+
+
 def pair_split_sdpa(
-    tt_q, k_cache, v_cache, cache_pos, page_table, config, weights, program_config, mesh_config, ccl_manager
+    tt_q,
+    k_cache,
+    v_cache,
+    cache_pos,
+    page_table,
+    config,
+    weights,
+    program_config,
+    mesh_config,
+    ccl_manager,
+    group=False,
 ):
     """One chip's pair-split decode attention merged with its partner's: ``SdpaDecodeLse(pair_split=True)`` over
     this chip's half (``c % 2``) of the row's key chunks, with the stock call's program config and compute config,
@@ -365,8 +402,15 @@ def pair_split_sdpa(
 
     ``GEMMA4_KV_PAIR_SHARD``: the chip holds only its half of every logical block (``tt/kv_pair_shard.py``), so the
     op runs ``half_block=True`` over the logical table (each chip deriving its position from the row's) and a
-    refusal raises: no chip holds every key, the stock fallback would attend half of them."""
+    refusal raises: no chip holds every key, the stock fallback would attend half of them.
+
+    ``group`` (``GEMMA4_SDPA_GROUP_SPLIT``, ``weights`` the group view): part ``i % G`` of the keys on device ``i`` of
+    the view's TP axis (``weights.split_parts`` / ``split_axis``), merged by ``pair_merge`` (G = 2) or ``group_merge``
+    (G > 2); the caller scales a refused call's stock output by ``1 / G``. Never half-block."""
     from models.demos.gemma4.custom_ops.sdpa_decode_lse import SdpaDecodeLse
+
+    parts = int(weights.split_parts) if group else 2
+    split_kw = dict(split_parts=parts, split_axis=int(weights.split_axis)) if group else {}
 
     kwargs = dict(
         scale=1.0,
@@ -378,13 +422,27 @@ def pair_split_sdpa(
     )
     # pair_split=True: the half-block mode runs on the pair split's meshes too (one program per column parity)
     reason = SdpaDecodeLse.unsupported_reason(
-        tt_q, k_cache, v_cache, cache_pos, page_table, memory_config=ttnn.DRAM_MEMORY_CONFIG, pair_split=True, **kwargs
+        tt_q,
+        k_cache,
+        v_cache,
+        cache_pos,
+        page_table,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        pair_split=True,
+        **split_kw,
+        **kwargs,
     )
-    half_block = kv_pair_shard_enabled()
+    half_block = kv_pair_shard_enabled() and not group
     if reason is not None:
         if half_block:
             raise ValueError(f"{KV_PAIR_SHARD_ENV}: sdpa_decode_lse refuses a pair-sharded global decode: {reason}")
-        log_once(f"sdpa_decode_lse refuses the call; the stock op attends every key on both chips: {reason}")
+        if group:
+            log_once(
+                f"sdpa_decode_lse refuses the call; the stock op attends every key on all {parts} chips: {reason}",
+                GROUP_SPLIT_ENV,
+            )
+        else:
+            log_once(f"sdpa_decode_lse refuses the call; the stock op attends every key on both chips: {reason}")
         return None
     out, stats = SdpaDecodeLse.op(
         tt_q,
@@ -396,8 +454,11 @@ def pair_split_sdpa(
         stats_memory_config=ttnn.DRAM_MEMORY_CONFIG,
         pair_split=not half_block,
         half_block=half_block,
+        **split_kw,
         **kwargs,
     )
+    if parts > 2:
+        return group_merge(out, stats, weights.group_mask, mesh_config, ccl_manager, scale=kwargs["scale"])
     return pair_merge(out, stats, weights.pair_selector, mesh_config, ccl_manager, scale=kwargs["scale"])
 
 
@@ -436,6 +497,63 @@ def pair_merge(out, stats, selector, mesh_config, ccl_manager, scale=1.0):
     ttnn.deallocate(diff)
     w32 = ttnn.sigmoid(clamped)
     ttnn.deallocate(clamped)
+    w_rows = ttnn.typecast(w32, ttnn.bfloat16)
+    ttnn.deallocate(w32)
+    w = ttnn.reshape(w_rows, (1, B, H, 1))
+    merged = ttnn.multiply(out, w, memory_config=ttnn.DRAM_MEMORY_CONFIG)  # w broadcast over head_dim
+    ttnn.deallocate(out)
+    ttnn.deallocate(w)
+    return merged
+
+
+def _stats_lse(stats, B, H, scale):
+    """``scale * m + ln(l)`` in fp32 ``[1, B, H, 1]`` from the bf16 stats of ``SdpaDecodeLse`` (consumed), and a second
+    copy of the same values (the gather consumes its input)."""
+    stats32 = ttnn.typecast(stats, ttnn.float32)
+    ttnn.deallocate(stats)
+    m = ttnn.slice(stats32, [0, 0, 0, STATS_M_COL], [1, B, H, STATS_M_COL + 1])
+    l = ttnn.slice(stats32, [0, 0, 0, STATS_L_COL], [1, B, H, STATS_L_COL + 1])
+    ln_l = ttnn.log(l)
+    if scale != 1.0:
+        m_scaled = ttnn.multiply(m, float(scale))
+        ttnn.deallocate(m)
+        m = m_scaled
+    lse = ttnn.add(m, ln_l)
+    lse_copy = ttnn.add(m, ln_l)
+    for t in (m, l, ln_l, stats32):
+        ttnn.deallocate(t)
+    return lse, lse_copy
+
+
+def group_merge(out, stats, mask, mesh_config, ccl_manager, scale=1.0):
+    """``GEMMA4_SDPA_GROUP_SPLIT`` with G > 2 chips per KV head: ``w_c * out`` with ``w_c = exp(lse_c - logsumexp_{j in
+    group(c)} lse_j) = 1 / sum_{j in group(c)} exp(lse_j - lse_c)`` (``sdpa_pair_split.group_merge_reference``).
+    Device-only and trace-safe like ``pair_merge``: the fp32 LSE from the two stats columns, flattened to ``[1, 1,
+    B*H, 1]`` and all-gathered over the TP axis on dim 1 (``[1, tp, B*H, 1]``), minus the chip's own LSE (broadcast
+    over the gathered dim), clamped to +-LOGIT_CLAMP (an empty part sits at ~-3e4: its own weight ~1e-28, its term
+    in the others' sums ~1e-28), exponentiated, masked to the chip's group (``mask [1, tp, 1, 1]``; None when every
+    chip of the axis is one group), summed over the gathered dim (fp32) and inverted. ``out [1, B, H, D]`` bf16 and
+    ``stats`` are consumed."""
+    B, H = int(out.shape[1]), int(out.shape[2])
+    lse, lse_self = _stats_lse(stats, B, H, scale)
+    lse_rows = ttnn.reshape(lse, (1, 1, B * H, 1))
+    self_rows = ttnn.reshape(lse_self, (1, 1, B * H, 1))
+    gathered = ccl_allgather(lse_rows, mesh_config, ccl_manager, dim=1)  # [1, tp, B*H, 1]; consumes lse_rows
+    diff = ttnn.subtract(gathered, self_rows)  # [1, tp, B*H, 1] = lse_j - lse_self
+    ttnn.deallocate(gathered)
+    ttnn.deallocate(self_rows)
+    clamped = ttnn.clamp(diff, min=-LOGIT_CLAMP, max=LOGIT_CLAMP)
+    ttnn.deallocate(diff)
+    terms = ttnn.exp(clamped)
+    ttnn.deallocate(clamped)
+    if mask is not None:
+        masked = ttnn.multiply(terms, mask)
+        ttnn.deallocate(terms)
+        terms = masked
+    total = ttnn.sum(terms, dim=1, keepdim=True)  # [1, 1, B*H, 1] >= 1 (the chip's own term is exp(0))
+    ttnn.deallocate(terms)
+    w32 = ttnn.reciprocal(total)
+    ttnn.deallocate(total)
     w_rows = ttnn.typecast(w32, ttnn.bfloat16)
     ttnn.deallocate(w32)
     w = ttnn.reshape(w_rows, (1, B, H, 1))
@@ -512,10 +630,16 @@ def decode_forward(
     tp = mesh_config.tp if mesh_config else 1
     # GEMMA4_SDPA_PAIR_SPLIT: a qualifying global layer decodes on its pair view (pair QKV / o_proj): each chip runs
     # the whole KV group's q heads, twice the 4-head layout's, so the local q-head count derives from tp / 2.
+    # GEMMA4_SDPA_GROUP_SPLIT: the same on the group view, G = weights.group.split_parts chips per KV head (tp / G).
     pair = pair_split_active(weights, page_table, kv_cache, is_kv_shared, sequential_kv_write)
+    group = not pair and group_split_active(weights, page_table, kv_cache, is_kv_shared, sequential_kv_write)
     if pair:
         weights = weights.pair
-    head_tp = tp // 2 if pair else tp
+    elif group:
+        weights = weights.group
+    split = pair or group
+    split_parts = int(weights.split_parts) if group else 2
+    head_tp = tp // split_parts if split else tp
 
     # 1. Fused QKV projection (GEMMA4_QKV_L1_OUT=1: straight into L1, where the head split reads it anyway --
     # drops the DRAM -> L1 copy of the Blackhole workaround in split_qkv_heads_decode)
@@ -863,9 +987,10 @@ def decode_forward(
 
     tt_sdpa = None
     pair_merged = False
-    if pair:
+    if split:
         # GEMMA4_SDPA_PAIR_SPLIT: this chip's half of the key chunks for the whole KV group, merged with the partner's
         # through their LSEs (pair_split_sdpa); it takes precedence over the split-independent op on these layers
+        # (GEMMA4_SDPA_GROUP_SPLIT: this chip's part of G)
         if tt_q.is_sharded():  # the fused head ops leave q height-sharded in L1; the op reads interleaved tiles
             q_dram = ttnn.to_memory_config(tt_q, ttnn.DRAM_MEMORY_CONFIG)
             tt_q.deallocate(True)
@@ -881,9 +1006,10 @@ def decode_forward(
             sdpa_program_config,
             mesh_config,
             ccl_manager,
+            group=group,
         )
         pair_merged = tt_sdpa is not None
-    if not pair and page_table is not None and sdpa_scratch is not None and splitfree_sdpa_enabled(config):
+    if not split and page_table is not None and sdpa_scratch is not None and splitfree_sdpa_enabled(config):
         # GEMMA4_SDPA_DECODE_SPLITFREE: the custom op (custom_ops/sdpa_decode_splitfree): fixed KV units per
         # (row, group) on a static core mapping, fp32 partials in the model's scratch, a fixed-order combine --
         # the row's bits do not depend on the padded batch or the cores (tt-metal#59300), and a lone row's units
@@ -954,9 +1080,10 @@ def decode_forward(
             program_config=sdpa_program_config,
         )
     tt_q.deallocate(True)
-    if pair and not pair_merged:
+    if split and not pair_merged:
         # the refused pair call: both chips of the pair attended every key of the group, so each contributes half
-        halved = ttnn.multiply(tt_sdpa, 0.5, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        # (the group split: each of the G chips 1 / G)
+        halved = ttnn.multiply(tt_sdpa, 1.0 / split_parts, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         tt_sdpa.deallocate(True)
         tt_sdpa = halved
 

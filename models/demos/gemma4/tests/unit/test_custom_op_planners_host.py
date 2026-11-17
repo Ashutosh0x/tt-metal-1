@@ -702,6 +702,127 @@ def test_sdpa_decode_lse_pair_halves_split_the_row():
     assert lp.pair_key_range(-1, 64, 0) == lp.pair_key_range(-1, 64, 1) == (0, 0)
 
 
+def test_sdpa_decode_lse_group_split_refusals_and_plan():
+    """The group split (``split_parts`` = G over mesh axis ``split_axis``): G = 2 over the columns is the pair (the
+    same refusals and plan); otherwise the split axis must hold a multiple of G devices. A G > 2 plan is the pair plan
+    plus ``SDPA_LSE_SPLIT_PARTS=G`` on every kernel, with one compile-time arg per device (its part, 0..G-1); a G = 2
+    plan carries no parts define."""
+    for shape in [None, (1, 1), (8,), (1, 3), (4, 1)]:
+        assert lp.split_reason(shape, 2, 1) == lp.pair_split_reason(shape)
+    assert lp.split_reason((1, 4), 4, 1) is None and lp.split_reason((1, 8), 4, 1) is None
+    assert lp.split_reason((4, 1), 2, 0) is None and lp.split_reason((4, 1), 4, 0) is None
+    assert "mesh axis 1" in lp.split_reason((1, 6), 4, 1)
+    assert "mesh axis 0" in lp.split_reason((1, 4), 2, 0)
+    assert "mesh device" in lp.split_reason(None, 4, 1)
+    assert [lp.pair_half_of(c, 4) for c in range(8)] == [0, 1, 2, 3] * 2
+
+    geo = _lse_geometry()
+    pair = lp.plan(geo, (13, 10), 16, pair_split=True)
+    assert lp.plan(geo, (13, 10), 16, pair_split=True, split_parts=2) == pair
+    group = lp.plan(geo, (13, 10), 16, pair_split=True, split_parts=4)
+    parts_define = (lp.SPLIT_PARTS_DEFINE, "4")
+    assert group.defines == pair.defines + (parts_define,)
+    assert group.dataflow_defines == (lp.PAIR_SPLIT_DEFINE, parts_define)
+    assert [group.pair_ct(h) for h in range(4)] == [(0,), (1,), (2,), (3,)]
+    assert (group.cores, group.cbs, group.reader_ct, group.writer_ct, group.compute_ct) == (
+        pair.cores,
+        pair.cbs,
+        pair.reader_ct,
+        pair.writer_ct,
+        pair.compute_ct,
+    )
+    with pytest.raises(ValueError, match="pair half"):  # allow-pytest.raises (pure)
+        group.pair_ct(4)
+    with pytest.raises(ValueError, match="split_parts"):  # allow-pytest.raises (pure)
+        lp.plan(geo, (13, 10), 16, pair_split=True, split_parts=1)
+    from pathlib import Path
+
+    hpp = (Path(lp.__file__).parent / "kernels" / "pair_split.hpp").read_text()
+    assert f"#ifndef {lp.SPLIT_PARTS_DEFINE}" in hpp and f"#define {lp.SPLIT_PARTS_DEFINE} 2" in hpp
+
+
+def test_sdpa_decode_lse_group_parts_split_the_row():
+    """The group split's chunk ranges (``pair_workload_for_core(..., parts)``, the mirror of kernels/pair_split.hpp):
+    part p takes chunks [ceil(p n / G), ceil((p + 1) n / G)), the parts together every chunk once (some empty when
+    n < G); G = 2 gives the pair's halves; on a device the members with data are a prefix with ``member <
+    part_chunks`` exactly "has data"; the row's last chunk sits on the root of the part holding it; no core takes
+    more than ceil(ceil(n / G) / cores) chunks; ``pair_key_range`` is the part's chunks clipped to cur_pos."""
+    for parts in (2, 3, 4):
+        for k in (32, 64):
+            for cores in (1, 3, 8, 16):
+                positions = {0, 1, k - 1, k, 2 * k, 3 * k + 5, parts * k - 1, parts * k, 4095, 65536, 86015}
+                positions |= {parts * cores * k - 1, parts * cores * k + k, cores * k + 3}
+                for cur_pos in sorted(positions):
+                    n = -(-(cur_pos + 1) // k)
+                    seen = []
+                    for part in range(parts):
+                        base, cnt = lp.pair_half_chunks(n, part, parts)
+                        if parts == 2:
+                            assert (base, cnt) == lp.pair_half_chunks(n, part)
+                        work = [lp.pair_workload_for_core(cur_pos, c, cores, k, part, parts) for c in range(cores)]
+                        assert all(w[0] == n * k // lp.TILE and w[1] == n and w[4] == cnt for w in work)
+                        chunks = sorted(i for w in work for i in range(w[2], w[3]))
+                        assert chunks == list(range(base, base + cnt)), (parts, k, cores, cur_pos, part)
+                        assert [w[2] < w[3] for w in work] == [c < cnt for c in range(cores)]
+                        assert max(w[3] - w[2] for w in work) <= -(-(-(-n // parts)) // cores)
+                        if cnt:
+                            assert work[0][3] == base + cnt
+                            if base + cnt == n:
+                                assert [c for c, w in enumerate(work) if w[2] <= n - 1 < w[3]] == [0]
+                        lo, hi = lp.pair_key_range(cur_pos, k, part, parts)
+                        want = (base * k, min((base + cnt) * k, cur_pos + 1)) if cnt else (hi, hi)
+                        assert (lo, hi) == want, (parts, k, cur_pos, part)
+                        seen += chunks
+                    assert sorted(seen) == list(range(n))
+
+
+def test_sdpa_decode_lse_group_split_tree_and_merge_give_the_full_row():
+    """G = 4 chips in torch: per part each member's chunks, the group tree with the active-child test (``child <
+    part_chunks``), the root's (m, l, O / l) or the empty-part sentinel, then each chip's weight ``w_c = 1 / sum_j
+    exp(clamp(lse_j - lse_c))`` (the device ``group_merge``): sum_c w_c O_c is softmax(scale * s) @ V."""
+    import torch
+
+    torch.manual_seed(4)
+    scale, k, D, parts = 0.5, 32, 3, 4
+    m_empty = float(torch.tensor(lp.PAIR_EMPTY_M).to(torch.bfloat16))
+    for cores in (1, 2, 3, 5, 8):
+        params = [lp.tree_reduction_params(c, cores) for c in range(cores)]
+        for cur_pos in sorted({0, 5, 31, 32, 40, 95, 96, 130, 200, 4 * cores * k + 7, 9 * cores * k + 70}):
+            s = torch.randn(cur_pos + 1, dtype=torch.float64) * 3
+            v = torch.randn(cur_pos + 1, D, dtype=torch.float64)
+            got = []
+            for part in range(parts):
+                work = [lp.pair_workload_for_core(cur_pos, c, cores, k, part, parts) for c in range(cores)]
+                cnt = work[0][4]
+
+                def merged(c):
+                    keys = slice(work[c][2] * k, min(work[c][3] * k, cur_pos + 1))
+                    m = s[keys].max()
+                    p = torch.exp((s[keys] - m) * scale)
+                    l, o = p.sum(), p @ v[keys]
+                    for child in params[c].children:
+                        if child != lp.NONE and child < cnt:
+                            mc, lc, oc = merged(child)
+                            mn = torch.maximum(m, mc)
+                            ea, eb = torch.exp((m - mn) * scale), torch.exp((mc - mn) * scale)
+                            m, l, o = mn, l * ea + lc * eb, o * ea + oc * eb
+                    return m, l, o
+
+                if work[0][2] == work[0][3]:
+                    assert cnt == 0
+                    m, l, o = torch.tensor(m_empty, dtype=torch.float64), torch.tensor(lp.PAIR_EMPTY_L), torch.zeros(D)
+                else:
+                    m, l, o = merged(0)
+                    o = o / l
+                got.append((scale * m + torch.log(l), o.double()))
+            lse = torch.stack([g[0] for g in got])
+            out = sum(
+                g[1] / torch.exp((lse - g[0]).clamp(-64.0, 64.0)).sum() for g in got
+            )  # w_c O_c, w_c = 1 / sum_j exp(lse_j - lse_c)
+            assert torch.allclose(out, torch.softmax(s * scale, 0) @ v), (cores, cur_pos)
+            assert torch.allclose(torch.logsumexp(lse, 0), torch.logsumexp(s * scale, 0)), (cores, cur_pos)
+
+
 def test_sdpa_decode_lse_pair_split_tree_and_merge_give_the_full_row():
     """Both chips of a pair in torch: per half, each member's chunks (the causal mask clips the last), the group tree
     with the pair active-child test (``child < half_chunks``), the root's (m, l, O / l) -- or the empty-half sentinel

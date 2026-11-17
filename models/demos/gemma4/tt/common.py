@@ -29,7 +29,12 @@ from models.demos.gemma4.tt.mesh_orientation import dispatch_prefill_default
 from models.demos.gemma4.tt.model import Gemma4Model, apply_build_profile
 from models.demos.gemma4.tt.model_config import Gemma4AssistantArgs, Gemma4ModelArgs
 from models.demos.gemma4.tt.precision import Gemma4Precision
-from models.demos.gemma4.tt.sdpa_pair_split import pair_split_enabled, pair_split_mesh
+from models.demos.gemma4.tt.sdpa_pair_split import (
+    group_split_enabled,
+    group_split_mesh,
+    pair_split_enabled,
+    pair_split_mesh,
+)
 
 # Weights gemma4 consumes on the HOST (not just via ttnn.as_tensor) and that therefore must be
 # loaded for real even on a warm cache (see #45400 follow-up analysis of models/demos/gemma4/tt):
@@ -100,6 +105,10 @@ def gemma4_cache_layout(mesh_device, mesh_config):
     # knob is off, so the default identity (and every warm marker) is unchanged.
     if pair_split_enabled() and pair_split_mesh(getattr(mesh_device, "shape", None)):
         layout["sdpa_pair_split"] = "v1"
+    # GEMMA4_SDPA_GROUP_SPLIT adds the group view's QKV / o_proj copies (*_pair_* at G = 2, *_group{G}_* above) on a
+    # line mesh; absent when the knob is off, like the pair key.
+    if group_split_enabled() and group_split_mesh(getattr(mesh_device, "shape", None)):
+        layout["sdpa_group_split"] = "v1"
     return layout
 
 

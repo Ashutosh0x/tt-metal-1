@@ -19,6 +19,17 @@ tying ``Wv = Wk``), width ``(G + 2) * D`` (5120 for the 31B), and the o_proj row
 ``[G * D, hidden]`` (4096 x 5376): the TP=4 per-chip shapes of the 31B. The 4-head weights stay (prefill, the spec
 verify and the MTP drafter use them); the pair copies cost ``(5376 x 5120 + 4096 x 5376)`` bfloat8_b per global layer
 per chip, ~52 MB x 10 global layers on the 31B.
+
+``GEMMA4_SDPA_GROUP_SPLIT`` (default off): the same view over the ``G = tp / Hkv`` chips that hold each global KV
+head of a line mesh (one row or one column, TP over its devices, ``group_split_parts``): the 12B on the (1,4) row (one
+global KV head, 16 q heads: G = 4, every chip the whole q-head set) and the 26B-A4B on the (4,1) column (two KV heads:
+G = 2 over mesh axis 0, chips (0, 1) and (2, 3)). Device ``i`` of the TP axis holds KV group ``i // G`` and attends
+part ``i % G`` of every row's key chunks (``SdpaDecodeLse(pair_split=True, split_parts=G, split_axis=tp_axis)``);
+its view's QKV / o_proj are ``pair_qkv_weight`` / ``pair_o_proj_weight`` (the chip's whole KV group: Hq / Hkv q
+heads). The merge: G = 2 is the pair's sigmoid (the selector picks ``lse_self - lse_partner``); G > 2 gives each chip
+``w_c = 1 / sum_{j in group(c)} exp(clamp(lse_j - lse_c))`` (``group_merge_reference``), the gathered LSEs masked to
+the chip's group by ``group_mask`` (no mask when G = tp). The 12B's copies are its TP=1 shapes: (3840 x 9216 + 8192
+x 3840) bfloat8_b = ~71 MB per global layer per chip (+50 MB over the 4-head pair), 8 global layers.
 """
 
 from typing import Optional
@@ -26,9 +37,10 @@ from typing import Optional
 import torch
 from loguru import logger
 
-from models.demos.gemma4.tt.mesh_orientation import SDPA_PAIR_SPLIT_ENV, decode_flag
+from models.demos.gemma4.tt.mesh_orientation import SDPA_GROUP_SPLIT_ENV, SDPA_PAIR_SPLIT_ENV, decode_flag
 
 PAIR_SPLIT_ENV = SDPA_PAIR_SPLIT_ENV
+GROUP_SPLIT_ENV = SDPA_GROUP_SPLIT_ENV
 # What an empty half writes (SdpaDecodeLse pair mode): O = 0, m = EMPTY_HALF_M, l = 1 -- finite, so its merge weight
 # is ~0 and no NaN reaches the merge.
 EMPTY_HALF_M = -30000.0
@@ -42,12 +54,12 @@ STATS_L_COL = 32
 _LOGGED = set()
 
 
-def log_once(message: str):
+def log_once(message: str, env: str = PAIR_SPLIT_ENV):
     """One INFO line per distinct message (the build and the decode call sites log why a layer keeps the 4-head
-    path)."""
-    if message not in _LOGGED:
-        _LOGGED.add(message)
-        logger.info(f"{PAIR_SPLIT_ENV}: {message}")
+    path), prefixed with the knob (``env``) that asked for the split."""
+    if (env, message) not in _LOGGED:
+        _LOGGED.add((env, message))
+        logger.info(f"{env}: {message}")
 
 
 def pair_split_enabled() -> bool:
@@ -95,6 +107,78 @@ def pair_split_reason(
     return None
 
 
+def group_split_enabled() -> bool:
+    """The knob: ``GEMMA4_SDPA_GROUP_SPLIT=1`` (``decode_flag``: the env when set, else the build profile; off in
+    every profile)."""
+    return decode_flag(GROUP_SPLIT_ENV) == "1"
+
+
+def group_split_mesh(mesh_shape) -> bool:
+    """A mesh the group split can run on: a line of at least two devices (one row or one column)."""
+    shape = tuple(int(d) for d in mesh_shape) if mesh_shape is not None else ()
+    return len(shape) == 2 and min(shape) == 1 and max(shape) >= 2
+
+
+def group_split_parts(
+    *,
+    is_sliding: bool,
+    num_q_heads: int,
+    num_kv_heads: int,
+    tp: int,
+    mesh_shape,
+    tp_axis: int = 1,
+    kv_replicated: bool,
+    fractured: bool = False,
+):
+    """``(G, None)`` when a layer's decode attention can take the group split over the ``G = tp / Hkv >= 2`` chips
+    holding each of its KV heads, else ``(0, why not)``: a global layer on a line mesh with TP over the line's devices
+    (either axis), KV heads replicated across TP and ``Hkv`` dividing both ``Hq`` and ``tp``."""
+    if is_sliding:
+        return 0, "sliding layer"
+    shape = tuple(int(d) for d in mesh_shape) if mesh_shape is not None else ()
+    if not group_split_mesh(shape):
+        return 0, f"mesh {shape} is not a line (one row or one column) of at least 2 devices"
+    if fractured:
+        return 0, "weight_fracture build"
+    axis = int(tp_axis)
+    if axis not in (0, 1) or int(tp) != shape[axis]:
+        return 0, f"TP {tp} on axis {tp_axis} is not the line's {max(shape)} devices"
+    if not kv_replicated:
+        return 0, "KV heads are not replicated across TP"
+    nq, nkv, tp = int(num_q_heads), int(num_kv_heads), int(tp)
+    if nkv <= 0 or nq % nkv or nq % tp or tp % nkv:
+        return 0, f"{nq} q heads, {nkv} KV heads and TP {tp} do not nest"
+    parts = tp // nkv
+    if parts < 2:
+        return 0, f"each KV head sits on {parts} chip"
+    return parts, None
+
+
+def group_mask(tp: int, parts: int) -> torch.Tensor:
+    """``[1, tp * tp, 1, 1]`` fp32, sharded on dim 1 over the TP axis: device ``c`` holds the row with 1 at the
+    ``parts`` devices of its KV group (``c // parts``) and 0 elsewhere, the mask of the gathered LSE terms in the
+    group merge (all ones when ``parts == tp``: the merge then takes no mask)."""
+    tp, parts = int(tp), int(parts)
+    mask = torch.zeros(tp, tp, dtype=torch.float32)
+    for c in range(tp):
+        g = c // parts
+        mask[c, g * parts : (g + 1) * parts] = 1.0
+    return mask.reshape(1, tp * tp, 1, 1)
+
+
+def group_merge_reference(out, m, l, *, parts: int, scale: float = 1.0) -> torch.Tensor:
+    """Torch emulation of the device group merge (G = ``parts`` > 2) over the TP axis: ``out [tp, B, H, D]`` each
+    device's part-normalised output, ``m`` / ``l [tp, B, H]`` its statistics. Returns ``[tp, B, H, D]``, what each
+    device feeds its group o_proj: ``lse`` per device, the all-gather, ``d_cj = clamp(lse_j - lse_c)``, ``S_c =
+    sum_j mask_cj exp(d_cj)``, ``w_c = 1 / S_c`` (= ``exp(lse_c - logsumexp_{j in group} lse_j)``), ``w_c * out_c``."""
+    tp = int(out.shape[0])
+    lse = lse_from_m_l(m, l, scale)  # [tp, B, H]
+    mask = group_mask(tp, parts).reshape(tp, tp)
+    d = (lse[None, :] - lse[:, None]).clamp(-LOGIT_CLAMP, LOGIT_CLAMP)  # [c, j, B, H] = lse_j - lse_c
+    s = (torch.exp(d) * mask[:, :, None, None]).sum(dim=1)  # [tp, B, H]
+    return out.float() * (1.0 / s)[..., None]
+
+
 def pair_heads(num_q_heads: int, num_kv_heads: int) -> int:
     """q heads per chip under the pair split: the whole KV group."""
     return int(num_q_heads) // int(num_kv_heads)
@@ -103,12 +187,13 @@ def pair_heads(num_q_heads: int, num_kv_heads: int) -> int:
 def pair_qkv_weight(q_w, k_w, v_w, *, num_q_heads: int, num_kv_heads: int, head_dim: int, tp: int) -> torch.Tensor:
     """The fused pair QKV weight ``[hidden, tp * (G + 2) * D]`` from the HF ``q_proj [Hq*D, hidden]``, ``k_proj`` /
     ``v_proj [Hkv*D, hidden]``: column block ``i`` (sharded to device column ``i`` by the column-parallel mapper) is
-    ``[Wq of the G q heads of KV group i // 2 | Wk of head i // 2 | Wv of head i // 2]``, transposed."""
+    ``[Wq of the G q heads of KV group i // 2 | Wk of head i // 2 | Wv of head i // 2]``, transposed. The group split
+    (``tp / Hkv`` chips per KV head) takes the same layout with block ``i`` on KV group ``i * Hkv // tp``."""
     group = pair_heads(num_q_heads, num_kv_heads)
     d = int(head_dim)
     blocks = []
     for i in range(int(tp)):
-        g = i // 2
+        g = i * int(num_kv_heads) // int(tp)
         wq = q_w[g * group * d : (g + 1) * group * d].transpose(-2, -1)
         wk = k_w[g * d : (g + 1) * d].transpose(-2, -1)
         wv = v_w[g * d : (g + 1) * d].transpose(-2, -1)
@@ -119,10 +204,11 @@ def pair_qkv_weight(q_w, k_w, v_w, *, num_q_heads: int, num_kv_heads: int, head_
 def pair_o_proj_weight(o_w_t, *, num_q_heads: int, num_kv_heads: int, head_dim: int, tp: int) -> torch.Tensor:
     """The pair o_proj weight ``[tp * G * D, N]`` from the transposed HF ``o_proj`` ``[Hq*D, N]`` (N = hidden, padded
     as the caller pads it): row block ``i`` (sharded to device column ``i`` by the row-parallel mapper) is the rows of
-    the G q heads of KV group ``i // 2``."""
+    the G q heads of KV group ``i // 2`` (the group split: ``i * Hkv // tp``)."""
     group = pair_heads(num_q_heads, num_kv_heads)
     d = int(head_dim)
-    return torch.cat([o_w_t[(i // 2) * group * d : (i // 2 + 1) * group * d] for i in range(int(tp))], dim=-2)
+    tp, nkv = int(tp), int(num_kv_heads)
+    return torch.cat([o_w_t[(i * nkv // tp) * group * d : (i * nkv // tp + 1) * group * d] for i in range(tp)], dim=-2)
 
 
 def pair_selector(tp: int) -> torch.Tensor:

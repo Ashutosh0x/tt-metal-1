@@ -25,6 +25,11 @@ from models.demos.gemma4.config import MeshConfig
 from models.demos.gemma4.tt.decode_matmul import DecodeLinear, flag, pipeline_row_for
 from models.demos.gemma4.tt.dram_sharded import DramShardedLinear, can_dram_shard
 from models.demos.gemma4.tt.sdpa_pair_split import (
+    GROUP_SPLIT_ENV,
+    PAIR_SPLIT_ENV,
+    group_mask,
+    group_split_enabled,
+    group_split_parts,
     log_once,
     pair_heads,
     pair_o_proj_weight,
@@ -64,6 +69,16 @@ class AttentionWeights:
     # [1, tp, 1, 1] fp32 row picking ``lse_self - lse_partner`` out of the gathered LSEs. None: the 4-head path only.
     pair: "AttentionWeights" = None
     pair_selector: ttnn.Tensor = None
+    # GEMMA4_SDPA_GROUP_SPLIT (tt/sdpa_pair_split.py): the decode view of a global layer whose KV head sits on the G
+    # chips of a line mesh's TP axis (the 12B (1,4) row: G = 4; the 26B-A4B (4,1) column: G = 2) -- built like the pair
+    # view, kept apart from ``pair`` so the pair-only consumers (the prefix-LSE verify, GEMMA4_KV_PAIR_SHARD) never see
+    # it. A view carries its G (``split_parts``), the mesh axis of its TP group (``split_axis``) and, for G > 2 with
+    # several groups on the axis, ``group_mask`` (the [1, tp, 1, 1] fp32 row of the chip's group); G = 2 merges with
+    # ``pair_selector``.
+    group: "AttentionWeights" = None
+    group_mask: ttnn.Tensor = None
+    split_parts: int = 2
+    split_axis: int = 1
 
 
 def load_attention_weights(
@@ -331,6 +346,45 @@ def load_attention_weights(
             )
         elif not config.is_sliding:
             log_once(f"the global layers keep the 4-head decode attention: {reason}")
+    if allow_pair_split and weights.pair is None and group_split_enabled():
+        tp_axis = int(getattr(mesh_config, "tp_axis", 1))
+        parts, reason = group_split_parts(
+            is_sliding=bool(config.is_sliding),
+            num_q_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            tp=tp,
+            mesh_shape=getattr(mesh_device, "shape", None),
+            tp_axis=tp_axis,
+            kv_replicated=kv_replicated,
+            fractured=fractured,
+        )
+        if reason is None:
+            weights = replace(
+                weights,
+                group=_load_pair_weights(
+                    weights,
+                    mesh_device,
+                    config,
+                    state_dict,
+                    mesh_config,
+                    weight_dtype,
+                    tensor_cache_path,
+                    dram_shard=dram_shard,
+                    decode_1d=decode_1d,
+                    col_mapper=col_mapper,
+                    row_mapper=row_mapper,
+                    o_proj_pad_size=o_proj_pad_size,
+                    padded_local_hidden=padded_local_hidden,
+                    o_proj_cache_suffix=o_proj_cache_suffix,
+                    tp_suffix=tp_suffix,
+                    dtype_suffix=dtype_suffix,
+                    parts=parts,
+                    axis=tp_axis,
+                    env=GROUP_SPLIT_ENV,
+                ),
+            )
+        elif not config.is_sliding:
+            log_once(f"the global layers keep the 4-head decode attention: {reason}", GROUP_SPLIT_ENV)
     return weights
 
 
@@ -352,6 +406,9 @@ def _load_pair_weights(
     o_proj_cache_suffix,
     tp_suffix,
     dtype_suffix,
+    parts=2,
+    axis=1,
+    env=PAIR_SPLIT_ENV,
 ) -> AttentionWeights:
     """The ``GEMMA4_SDPA_PAIR_SPLIT`` decode view of a qualifying global layer: ``weights`` with the pair QKV / o_proj
     (tt/sdpa_pair_split.py) and the partner selector, built like the 4-head pair above (DramShardedLinear where the
@@ -361,7 +418,12 @@ def _load_pair_weights(
     group's K and V (V = K under K=V tying), and the o_proj rows of the same G heads: the TP/2 per-chip shapes (31B:
     5376 x 5120 and 4096 x 5376, its TP=4 shapes, so the DRAM-sharded pipeline rows are the TP/2 ones). They sit beside
     the 4-head weights, which prefill, the spec verify and the MTP drafter keep using: (5376 x 5120 + 4096 x 5376)
-    bfloat8_b = ~52 MB per global layer per chip, ~0.5 GB per chip over the 31B's 10 global layers."""
+    bfloat8_b = ~52 MB per global layer per chip, ~0.5 GB per chip over the 31B's 10 global layers.
+
+    ``parts`` / ``axis``: the ``GEMMA4_SDPA_GROUP_SPLIT`` view of G = ``parts`` chips per KV head along mesh axis
+    ``axis`` (the same layout with device ``i`` of the TP axis on KV group ``i // G``, the TP/G per-chip shapes): G = 2
+    keeps the pair's tensorbin names and selector (the same tensors), G > 2 writes ``*_group{G}_*`` tensorbins and
+    merges through ``group_mask`` (none when G = tp)."""
     tp = mesh_config.tp
     hidden_size = config.hidden_size
     head_dim = config.head_dim
@@ -382,8 +444,10 @@ def _load_pair_weights(
     else:
         qkv = None
         o_w = None
-    qkv_cache = get_cache_file_name(tensor_cache_path, f"wqkv_pair{tp_suffix}{dtype_suffix}")
-    oproj_cache = get_cache_file_name(tensor_cache_path, f"o_proj_pair{o_proj_cache_suffix}{tp_suffix}{dtype_suffix}")
+    parts = int(parts)
+    tag = "pair" if parts == 2 else f"group{parts}"
+    qkv_cache = get_cache_file_name(tensor_cache_path, f"wqkv_{tag}{tp_suffix}{dtype_suffix}")
+    oproj_cache = get_cache_file_name(tensor_cache_path, f"o_proj_{tag}{o_proj_cache_suffix}{tp_suffix}{dtype_suffix}")
 
     if dram_shard and can_dram_shard(hidden_size, qkv_n, dtype=weight_dtype):
         wqkv = DramShardedLinear(
@@ -394,7 +458,7 @@ def _load_pair_weights(
             n=qkv_n,
             dtype=weight_dtype,
             cache_file_name=(qkv_cache + ".ws") if qkv_cache else None,
-            pipeline_row=pipeline_row_for(mesh_device, hidden_size, "qkv", tp // 2),
+            pipeline_row=pipeline_row_for(mesh_device, hidden_size, "qkv", tp // parts),
         )
     else:
         wqkv = ttnn.as_tensor(
@@ -425,7 +489,7 @@ def _load_pair_weights(
             n=hidden_size,
             dtype=weight_dtype,
             cache_file_name=(oproj_cache + ".ws") if oproj_cache else None,
-            pipeline_row=pipeline_row_for(mesh_device, hidden_size, "out_proj", tp // 2),
+            pipeline_row=pipeline_row_for(mesh_device, hidden_size, "out_proj", tp // parts),
         )
     else:
         o_proj = ttnn.as_tensor(
@@ -447,14 +511,34 @@ def _load_pair_weights(
                 max_block_w=_ATTN_DECODE_BLOCK_W,
             )
 
-    # Device column c holds e_c - e_{c^1}: built once here, before any trace capture, and owned by the weights.
-    selector = ttnn.from_torch(
-        pair_selector(tp),
-        dtype=ttnn.float32,
-        layout=ttnn.TILE_LAYOUT,
-        device=mesh_device,
-        mesh_mapper=mesh_config.shard_mapper(mesh_device, tensor_dim=1),
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    # Device column c holds e_c - e_{c^1} (G = 2) / its group's mask row (G > 2 with several groups): built once
+    # here, before any trace capture, and owned by the weights.
+    def _per_chip_row(t):
+        return ttnn.from_torch(
+            t,
+            dtype=ttnn.float32,
+            layout=ttnn.TILE_LAYOUT,
+            device=mesh_device,
+            mesh_mapper=mesh_config.shard_mapper(mesh_device, tensor_dim=1),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    selector = _per_chip_row(pair_selector(tp)) if parts == 2 else None
+    mask = _per_chip_row(group_mask(tp, parts)) if 2 < parts < tp else None
+    if env == PAIR_SPLIT_ENV:
+        log_once(f"pair-split decode attention on the global layers: {group} q heads + 1 KV head per chip")
+    else:
+        log_once(
+            f"group-split decode attention on the global layers: {group} q heads + 1 KV head per chip, each KV head's "
+            f"keys split over {parts} chips of mesh axis {axis}",
+            env,
+        )
+    return replace(
+        weights,
+        wqkv=wqkv,
+        o_proj=o_proj,
+        pair_selector=selector,
+        group_mask=mask,
+        split_parts=parts,
+        split_axis=int(axis),
     )
-    log_once(f"pair-split decode attention on the global layers: {group} q heads + 1 KV head per chip")
-    return replace(weights, wqkv=wqkv, o_proj=o_proj, pair_selector=selector)

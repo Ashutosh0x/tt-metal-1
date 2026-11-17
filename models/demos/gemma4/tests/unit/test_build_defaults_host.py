@@ -657,6 +657,14 @@ def test_single_device_layout_has_the_trivial_partition(monkeypatch):
         assert gemma4_cache_layout(line, None)["sdpa_pair_split"] == "v1"
         monkeypatch.setenv("GEMMA4_SDPA_PAIR_SPLIT", "0")
         assert "sdpa_pair_split" not in gemma4_cache_layout(line, None)
+        # GEMMA4_SDPA_GROUP_SPLIT (off in every profile): its copies key the line meshes only when set
+        monkeypatch.delenv("GEMMA4_SDPA_GROUP_SPLIT", raising=False)
+        for shape in ((1, 4), (4, 1), (1, 8)):
+            assert "sdpa_group_split" not in gemma4_cache_layout(SimpleNamespace(shape=shape), None)
+        monkeypatch.setenv("GEMMA4_SDPA_GROUP_SPLIT", "1")
+        for shape in ((1, 4), (4, 1), (1, 8)):
+            assert gemma4_cache_layout(SimpleNamespace(shape=shape), None)["sdpa_group_split"] == "v1"
+        assert "sdpa_group_split" not in gemma4_cache_layout(SimpleNamespace(shape=(2, 4)), None)
     finally:
         clear_decode_fusion_profile()
 
