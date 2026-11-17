@@ -12,7 +12,8 @@ from its explicit ``indexer_types`` by ``full_indexer_rank``. What it changes:
     ``hy_v4`` is not AutoConfig-loadable on our transformers pin. When the checkpoint's config.json is
     readable it is validated against the constants and supplies the per-layer maps.
   * weights: ``TtHy4Runtime`` rebuilds a missing weight cache through the Hy4 checkpoint reader
-    (``tt/runners/hy4_checkpoint.py``: fused experts, MXFP8 scales, ``linear_gate`` -> ``g_proj``).
+    (``tt/runners/hy4_checkpoint.py``: fused experts, MXFP8 scales, ``linear_gate`` -> ``g_proj``,
+    ``learnable_sink_param`` -> ``attn_sink``).
   * mesh layout: TP32 / DP1 (``tp32``, the SC1 placement of #65884), selected by default. The shared prefill
     stack cannot run it yet, so it fails at runner start naming the blocking issues; GLM-5.3's SP 8 x TP 4
     stays as the explicitly selected DEV / NUMERICS layout (``PREFILL_HY4_LAYOUT=glm_prefill_sp8_tp4``). See
@@ -42,7 +43,6 @@ ALLOW_PENDING_DELTAS_ENV = "PREFILL_HY4_ALLOW_PENDING_DELTAS"
 # Hy4 deltas the prefill stack does not implement yet: config attribute -> (what, owning issue). An issue
 # that implements one deletes its entry here.
 PENDING_DELTAS = {
-    "mla_learnable_sink": ("learnable per-head attention sink in sparse MLA", "#65921"),
     "enable_ihc": ("iHC hyper-connection residual (hc_mult=4, fp32 streams)", "#65891"),
 }
 
