@@ -19,7 +19,6 @@ from helpers.stimuli_generator import StimuliSpec, generate_stimuli
 from helpers.test_variant_parameters import (
     LOOP_FACTOR,
     MATH_OP,
-    REDUCE_POOL_TYPE,
     TILE_COUNT,
     generate_input_dim,
 )
@@ -86,8 +85,7 @@ def _run_sfpu_reduce_sdpa(
         )
         # Keep this name literal so schema v4 can derive the perf compile parameters.
         templates = [
-            MATH_OP(mathop=mathop),
-            REDUCE_POOL_TYPE(reduce_pool),
+            MATH_OP(mathop=mathop, pool_type=reduce_pool),
             generate_input_dim(
                 input_dimensions,
                 input_dimensions,

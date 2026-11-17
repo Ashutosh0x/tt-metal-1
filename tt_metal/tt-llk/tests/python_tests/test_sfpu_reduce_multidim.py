@@ -51,10 +51,10 @@ from helpers.stimuli_config import StimuliConfig
 from helpers.test_config import TestConfig
 from helpers.test_variant_parameters import (
     APPROX_MODE,
+    MATH_OP,
     NUM_BLOCKS,
     NUM_TILES_IN_BLOCK,
     REDUCE_ORDER,
-    REDUCE_POOL_TYPE,
     TILE_COUNT,
     generate_input_dim,
 )
@@ -242,7 +242,7 @@ def test_sfpu_reduce_multidim(
         templates=[
             generate_input_dim(input_dimensions, input_dimensions),
             APPROX_MODE(ApproximationMode.No),
-            REDUCE_POOL_TYPE(reduce_pool),
+            MATH_OP(pool_type=reduce_pool),
             REDUCE_ORDER(reduce_order),
         ],
         runtimes=[
