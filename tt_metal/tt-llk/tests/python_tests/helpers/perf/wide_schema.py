@@ -73,6 +73,12 @@ DB_SCHEMA = [
     Column("formats.sfpu_dst", "string", True, "formats"),
     # flags
     Column("dest_acc", "string", True, "flags"),
+    Column("mm_transpose", "bool", True, "configuration"),
+    Column("preserve_src_zero_flag", "bool", True, "configuration"),
+    Column("read_transposed", "bool", True, "configuration"),
+    Column("sdpa_input_tile_offset", "int64", True, "configuration"),
+    Column("sdpa_row_stride", "int64", True, "configuration"),
+    Column("signal_granularity", "int64", True, "configuration"),
     Column("speed_of_light", "bool", True, "flags"),
     Column("unpack_to_dest", "string", True, "flags"),
     # key
