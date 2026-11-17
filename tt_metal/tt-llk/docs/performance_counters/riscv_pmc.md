@@ -87,8 +87,8 @@ markers from pass 0 only, which is correct because the selects do not change bet
 Firmware cost with the option on: BRISC grows by about 260 B, NCRISC by about 225 B, the Blackhole
 TRISCs by about 235 B, the active ethernet ERISC0 by about 265 B (17624 B of 24576 B), the Quasar TRISCs by 280 to
 300 B and the Quasar DM image by about 790 B (8100 B of 12288 B), 1104 B with all four DM counters armed (8412 B).
-The Blackhole BRISC region is 9728 B so that the hook still links next to the five Tensix counter groups (9468 B
-on a card with 7 DRAM banks).
+The Blackhole BRISC region is 9984 B so that the hook still links next to the five Tensix counter groups (9468 B
+on a card with 7 DRAM banks) and the NoC counter capture.
 
 Only one event pair is captured per run (two pairs on a Quasar data-movement core); a sweep over several pairs needs one run per pair. Without
 the option the hooks compile to nothing and the firmware images are byte-identical to a build without
