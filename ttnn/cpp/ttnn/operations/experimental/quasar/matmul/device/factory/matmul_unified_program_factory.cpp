@@ -314,16 +314,18 @@ ttnn::device_operation::ProgramArtifacts MatmulUnifiedProgramFactory::create_pro
     ComputeHardwareConfig compute_hw_config =
         ttnn::to_compute_hardware_config(operation_attributes.compute_kernel_config.value());
     if (plan.fp32_dest_acc_en) {
-        // With a 32-bit DST every consumed 32-bit DFB needs an explicit unpack mode. The partials are
-        // reloaded with a data copy into DST, so unpack them straight to DST and keep fp32 precision;
-        // fp32 operands feed the FPU and go through SrcA/SrcB.
+        // With a 32-bit DST every consumed 32-bit DFB needs an explicit unpack mode. All of them go
+        // through SrcA/SrcB, the partials too. On Quasar one UnpackToDest DFB turns on UnpackToDestEn for
+        // the whole kernel, and then math waits for the unpack thread to commit each DST section, while
+        // that same section's matmul unpacks fill the src banks first: a deadlock as soon as a section
+        // needs more src entries than the banks hold. The partials reload rounds through SrcA, as on WH/BH.
         auto is_32bit = [](tt::DataFormat format) {
             return format == tt::DataFormat::Float32 || format == tt::DataFormat::Int32 ||
                    format == tt::DataFormat::UInt32;
         };
         ComputeHardwareConfig::ComputeUnpackModes& modes = compute_hw_config.unpack_modes;
         if (is_32bit(plan.C_partials_format)) {
-            modes.emplace(C_PARTIALS_DFB, tt::tt_metal::UnpackMode::UnpackToDest);
+            modes.emplace(C_PARTIALS_DFB, tt::tt_metal::UnpackMode::UnpackToSrc);
         }
         if (is_32bit(plan.A_format)) {
             modes.emplace(A_SLICE_DFB, tt::tt_metal::UnpackMode::UnpackToSrc);
