@@ -1009,7 +1009,11 @@ def test_sdpa_decode_lse_group_split_on_four_chips(
             f"G={parts} axis={axis} B={B} pos={pos} {cfg}: group {g} pcc(merged, full) {pcc_full:.6f}, "
             f"pcc(merged, torch) {pcc_ref:.6f}, pcc(full, torch) {pcc_full_ref:.6f}, |lse - lse_full| {lse_err:.4f}"
         )
-        assert pcc_full >= PAIR_PCC_MIN, f"group {g}: merged vs full pcc {pcc_full:.6f}"
+        # stock (bf16 dest): both arms sit at ~0.997 vs fp32 torch and differ by their bf16 accumulation order (4 parts
+        # of 21K keys vs one 86K reduction: 0.99989 at B=1, 86K), so the contract there is the torch check below
+        assert pcc_full >= (
+            PAIR_PCC_MIN if cfg == "fp32_dest" else PCC_MIN
+        ), f"group {g}: merged vs full {pcc_full:.6f}"
         _assert_merged_vs_torch(cfg, pcc_ref, pcc_full_ref)
         assert lse_err <= 0.05 + 0.01 * lse_full[live].abs().max().item(), f"group {g}: merged lse off by {lse_err:.4f}"
         for i in members:  # the exact softmax weight of each part: exp(lse_i - lse_group)
