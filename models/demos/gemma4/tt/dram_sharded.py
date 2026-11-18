@@ -22,6 +22,7 @@ import ttnn
 from models.common.tensor_utils import with_dram_sharded_cores_per_bank
 from models.common.utility_functions import is_blackhole
 from models.demos.gemma4.tt.mesh_orientation import decode_flag
+from models.demos.gemma4.tt.prefill_matmul import planned_linear, prefill_mm_plan_enabled, prefill_mm_plan_keep_kb
 
 TILE_SIZE = 32
 # P150 Blackhole DRAM bank count. Wormhole meshes differ — can_dram_shard is
@@ -377,6 +378,15 @@ def prefill_wide_grid_default(mesh_device, k=None, n=None) -> bool:
     return k in hidden or n in hidden
 
 
+def _device_grid(mesh_device):
+    """``(x, y)`` of the device compute grid, None without one (host-only stand-ins)."""
+    try:
+        g = mesh_device.compute_with_storage_grid_size()
+        return (int(g.x), int(g.y))
+    except Exception:  # noqa: BLE001 - host-only stand-ins
+        return None
+
+
 def _device_grid_cols(mesh_device) -> int:
     """The compute grid width of the device (the wide config's column bound); the safe default without one."""
     try:
@@ -531,6 +541,7 @@ class DramShardedLinear:
             _device_grid_cols(mesh_device), max(1, int(os.environ.get("GEMMA4_PREFILL_MAX_COLS") or 1 << 10))
         )
         self._weight_tile_bytes = weight_tile_bytes(dtype)
+        self._grid = _device_grid(mesh_device)
         # the slab this weight's CBs allow, per Dest accumulation format (GEMMA4_PREFILL_CUTOFF still pins it): the
         # fp32 Dest compute config of the prefill linears adds an fp32 partials block per core
         self._slab_rows_by_acc = {
@@ -780,6 +791,30 @@ class DramShardedLinear:
             ttnn.dump_device_memory_state(x_work.device(), f"prefill_matmul_k{self.k}_n{self.n}_M{M}")
         fp32 = fp32_dest_acc(compute_kernel_config)
         slab = prefill_divisor_slab(M, self._slab_rows_by_acc[fp32])
+        fixed_kb = None
+        if prefill_mm_plan_keep_kb():
+            # the K block of the config this call takes below (one config for the whole call: M within one slab or
+            # a slab multiple), so the planned config is bitwise it; the chunked remainder path keeps its configs
+            fixed_kb = self._prefill_pc(min(M, slab), fp32_acc=fp32).in0_block_w if (M <= slab or M % slab == 0) else 0
+        if self._grid is not None and fixed_kb != 0 and prefill_mm_plan_enabled(self.k, self.n):
+            # GEMMA4_PREFILL_MM_PLAN: the planned slab / grid (/ K block) (tt/prefill_matmul.py); None = no plan fits
+            out = planned_linear(
+                x_work,
+                self.weight,
+                M,
+                self.k,
+                self.n,
+                grid=self._grid,
+                weight_tile_bytes=self._weight_tile_bytes,
+                fp32_acc=fp32,
+                budget=_L1_BYTES - max(0, _PREFILL_L1_HEADROOM),
+                exact_n=True,
+                compute_kernel_config=compute_kernel_config,
+                memory_config=out_mc,
+                fixed_kb=fixed_kb,
+            )
+            if out is not None:
+                return _restore(out)
         if M <= slab:
             pc = self._prefill_pc(M, fp32_acc=fp32)
             out = ttnn.linear(

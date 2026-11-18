@@ -468,5 +468,27 @@ def test_prefill_wide_progcfg_host(monkeypatch):
     monkeypatch.setattr(ds, "is_blackhole", lambda: True)
     monkeypatch.setenv(PREFILL_WIDE_GRID_ENV, "0")
     assert prefill_wide_grid_default(mesh, 3840, 7680) is False
+    # GEMMA4_PREFILL_MM_PLAN (tt/prefill_matmul.py): the planned 4096-row configs of the 12B / 26B TP=4 linears on
+    # the 12x10 Galaxy grid are the measured fastest ones (2026-11-18 sweep), every one within the L1 budget, N split
+    # exactly for the DRAM-width-sharded weights
+    from models.demos.gemma4.tt import prefill_matmul as pm
+
+    measured = {  # (k, n, weight tile bytes, exact N): (slab rows, cols, rows, in0_block_w)
+        (3840, 7680, 1088, True): (2048, 12, 10, 6),  # 12B gate_up
+        (3840, 3840, 1088, True): (2048, 12, 10, 15),  # 12B down
+        (3840, 2048, 1088, True): (4096, 8, 10, 10),  # 12B wqkv (sliding)
+        (1024, 3840, 1088, True): (2048, 12, 10, 16),  # 12B o_proj (sliding)
+        (2816, 2048, 2048, False): (4096, 11, 10, 11),  # 26B wqkv (sliding)
+        (2816, 1088, 2048, False): (4096, 12, 10, 11),  # 26B shared gate_up
+        (544, 2816, 2048, False): (2048, 11, 10, 17),  # 26B shared down
+    }
+    for (k, n, wtb, exact), want in measured.items():
+        p = pm.plan(4096, k, n, (12, 10), wtb, True, budget, exact)
+        assert p[:4] == want, (k, n, p)
+        slab, cols, rows, kb, h, w, pM, pN, _ = p
+        assert pm.cb_bytes(pM, pN, kb, wtb, True) <= budget and pN % w == 0 and h == 1
+        assert (not exact) or (n // TILE_SIZE) % cols == 0
+    kw = dict(grid=(12, 10), weight_tile_bytes=1088, fp32_acc=True, budget=budget, exact_n=True)
+    assert pm.planned_linear(None, None, 512, 3840, 7680, compute_kernel_config=None, memory_config=None, **kw) is None
     monkeypatch.setenv(PREFILL_WIDE_GRID_ENV, "1")
     assert prefill_wide_grid_default(mesh, 5376, 10752) is True
