@@ -47,7 +47,7 @@ from models.demos.deepseek_v3_d_p.utils.kv_cache_utils import (
     init_mla_kv_cache,
 )
 from models.demos.deepseek_v3_d_p.utils.test_utils import WH_WORKER_L1_SIZE
-from tests.ttnn.utils_for_testing import comp_pcc
+from tt_py_test_utils_common.utils_for_testing import comp_pcc
 
 CACHE_DIR = Path("/tmp/DS_PREFILL_sparse_mla")
 SEQ_LEN = 256
@@ -284,7 +284,7 @@ def test_indexer_selection_stages_thread_runtime_metadata(monkeypatch, use_metad
         ),
         "subdevice_id": subdevice_id,
         "sub_core_grids": core_grid,
-        # Unset here; the overlap region is what passes NOC_1.
+        # Unset here; the overlap region is what passes NOC_0.
         "dram_read_noc": None,
     }
     assert indexer.finalize_distribution(selected, state) is local_indices
@@ -482,7 +482,7 @@ def test_sparse_mla_overlap_region_orders_join_before_distribution(monkeypatch):
         def select_local(self, actual_state, **kwargs):
             assert mla.mesh_device.loaded
             assert actual_state is state
-            assert kwargs == {"subdevice_id": "topk_sd", "sub_core_grids": "topk_grid", "dram_read_noc": ttnn.NOC.NOC_1}
+            assert kwargs == {"subdevice_id": "topk_sd", "sub_core_grids": "topk_grid", "dram_read_noc": ttnn.NOC.NOC_0}
             events.append("topk")
             return local_indices
 
