@@ -20,6 +20,9 @@
 // out into a column vector (cpivotdy) and replaced by zero; pass 2 reads logits and gradient.
 // With chunks > 1, between the passes every core of a row waits until all of them have published their
 // partial statistics, then gathers them as lanes of one tile per statistic.
+// Vocabulary-parallel: targets are global, this shard owns [first_v, first_v + width). VP_STATS reads like the
+// cross-entropy forward. VP_BACKWARD reads the row state (M, l) instead of a statistics pass. VP_COMBINE reads
+// the all-gathered per-shard records of each row (one tile per shard) and hands them over as lanes.
 void kernel_main() {
     constexpr uint32_t wt = get_compile_time_arg_val(0);
     constexpr uint32_t width = get_compile_time_arg_val(2), input_fp32 = get_compile_time_arg_val(3);
@@ -31,6 +34,7 @@ void kernel_main() {
     const uint32_t start = get_arg_val<uint32_t>(5), begin = get_arg_val<uint32_t>(6), end = get_arg_val<uint32_t>(7);
     // Each push is `block` tiles and block divides end - begin, so pushes never straddle the ring's end.
     const uint32_t chunk = get_arg_val<uint32_t>(8), block = get_arg_val<uint32_t>(9);
+    [[maybe_unused]] const uint32_t first_v = get_arg_val<uint32_t>(11);
     constexpr auto xa = TensorAccessorArgs<10>();
     const auto input = TensorAccessor(xa, x);
 #if defined(BACKWARD) && !defined(CROSS_ENTROPY)
@@ -43,6 +47,15 @@ void kernel_main() {
 #else
     constexpr auto pa = TensorAccessorArgs<xa.next_compile_time_args_offset()>();
     constexpr uint32_t partials = 3;
+#endif
+#ifdef VP_COMBINE
+    // Column-0 mask for the loss tile.
+    DataflowBuffer target_x(25), first_col(27), record(28);
+    first_col.reserve_back(1);
+    log_softmax_tile::zero_fp32(first_col.get_write_ptr());
+    for (uint32_t r = 0; r < 32; ++r)
+        log_softmax_tile::store_fp32(first_col.get_write_ptr(), log_softmax_tile::offset(r, 0), 0x3F800000U);
+    first_col.push_back(1);
 #endif
 #ifdef CROSS_ENTROPY
     constexpr auto ta = TensorAccessorArgs<pa.next_compile_time_args_offset()>();
@@ -65,6 +78,15 @@ void kernel_main() {
     constexpr auto ga = TensorAccessorArgs<ta.next_compile_time_args_offset()>();
     const auto upstream = TensorAccessor(ga, dy);
     DataflowBuffer upstream_vec(29), upstream_tile(30);
+#endif
+#ifdef VP_BACKWARD
+    // The row state accessor comes last.
+#ifdef UPSTREAM_GRAD
+    constexpr auto va = TensorAccessorArgs<ga.next_compile_time_args_offset()>();
+#else
+    constexpr auto va = TensorAccessorArgs<ta.next_compile_time_args_offset()>();
+#endif
+    const auto row_state = TensorAccessor(va, state);
 #endif
 #endif
     const Noc noc;
@@ -104,6 +126,40 @@ void kernel_main() {
     };
 
     for (uint32_t row = start; row < start + count; ++row) {
+#ifdef VP_COMBINE
+        // Shard g's record (columns m, k, tail, x_t) becomes lane g of the three statistic tiles. Exactly one
+        // shard holds a nonzero target logit (the others hold +0), so it is selected, not summed.
+        DataflowBuffer m_lanes(17), k_lanes(18), t_lanes(19);
+        m_lanes.reserve_back(1);
+        k_lanes.reserve_back(1);
+        t_lanes.reserve_back(1);
+        target_x.reserve_back(1);
+        log_softmax_tile::fill_fp32(m_lanes.get_write_ptr(), -__builtin_inff());
+        log_softmax_tile::fill_fp32(k_lanes.get_write_ptr(), __builtin_inff());
+        log_softmax_tile::zero_fp32(t_lanes.get_write_ptr());
+        log_softmax_tile::zero_fp32(target_x.get_write_ptr());
+        for (uint32_t g = 0; g < wt; ++g) {
+            record.reserve_back(1);
+            noc.async_read(input, record, fp32_bytes, {.page_id = row * wt + g}, {});
+            noc.async_read_barrier();
+            const uint32_t from = record.get_write_ptr();
+            for (uint32_t r = 0; r < 32; ++r) {
+                const uint32_t lane = log_softmax_tile::offset(r, g);
+                log_softmax_tile::copy_fp32(from, log_softmax_tile::offset(r, 0), m_lanes.get_write_ptr(), lane);
+                log_softmax_tile::copy_fp32(from, log_softmax_tile::offset(r, 1), k_lanes.get_write_ptr(), lane);
+                log_softmax_tile::copy_fp32(from, log_softmax_tile::offset(r, 2), t_lanes.get_write_ptr(), lane);
+                const uint32_t x_t = log_softmax_tile::words(from)[log_softmax_tile::offset(r, 3)];
+                if (x_t != 0U) {
+                    log_softmax_tile::store_fp32(target_x.get_write_ptr(), log_softmax_tile::offset(r, 0), x_t);
+                }
+            }
+        }
+        m_lanes.push_back(1);
+        k_lanes.push_back(1);
+        t_lanes.push_back(1);
+        target_x.push_back(1);
+        continue;
+#endif
 #ifdef CROSS_ENTROPY
         // Targets of the 32 physical rows (out of range, including padded rows, becomes 0xFFFFFFFF) and their
         // logits as an FP32 column vector; an out-of-range target contributes a zero logit.
@@ -113,6 +169,8 @@ void kernel_main() {
             targets, target_address, row, target_tiled_h, target_page_bytes, 32 * sizeof(uint32_t));
         auto target = log_softmax_tile::words(target_address);
         for (uint32_t r = 0; r < 32; ++r) {
+            // Shard-local column; targets on other shards (and invalid ones) wrap far above width.
+            target[r] -= first_v;
             if (target[r] >= width) {
                 target[r] = 0xFFFFFFFFU;
                 continue;
@@ -151,7 +209,19 @@ void kernel_main() {
         upstream_vec.push_back(1);
 #endif
 #endif
-#if !defined(BACKWARD) || defined(CROSS_ENTROPY)
+#if defined(VP_BACKWARD)
+        // Row state of the combined statistics: maximum M (page 2 * row) and log1p(tail) l (page 2 * row + 1).
+        {
+            DataflowBuffer max_vec(7), norm_vec(13);
+            max_vec.reserve_back(1);
+            norm_vec.reserve_back(1);
+            noc.async_read(row_state, max_vec, fp32_bytes, {.page_id = 2 * row}, {});
+            noc.async_read(row_state, norm_vec, fp32_bytes, {.page_id = 2 * row + 1}, {});
+            noc.async_read_barrier();
+            max_vec.push_back(1);
+            norm_vec.push_back(1);
+        }
+#elif !defined(BACKWARD) || defined(CROSS_ENTROPY)
         stream(input, xb, bytes, row, pad_neg_inf);
 #else
         // Row state: maximum, selected index and log1p(tail) column vectors.
@@ -191,8 +261,8 @@ void kernel_main() {
                 noc_semaphore_wait(arrive, chunks);
                 noc_semaphore_set(arrive, 0);
                 for (uint32_t g = 0; g < chunks; ++g) {
-                    const uint32_t core_x = get_arg_val<uint32_t>(11 + 2 * g),
-                                   core_y = get_arg_val<uint32_t>(12 + 2 * g);
+                    const uint32_t core_x = get_arg_val<uint32_t>(12 + 2 * g),
+                                   core_y = get_arg_val<uint32_t>(13 + 2 * g);
                     noc_semaphore_inc(get_noc_addr(core_x, core_y, get_semaphore(go_sem)), 1);
                 }
             }

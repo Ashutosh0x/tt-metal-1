@@ -192,25 +192,9 @@ To measure the old kernels, build the benchmark on the parent revision.
 
 ### Vocabulary-parallel loss (`ops::distributed::vocab_parallel_cross_entropy_loss`)
 
-It is a composite of TTNN ops and collapses in three places:
-
-1. `log_normalizer = global_max + log(global_sum)` with `global_sum` including the
-   maximum's `e^0`: `log(1 + T)` is 0 for `T < 2^-24`.
-2. `per_pos = log_normalizer - target_logit` in FP32 adds `log(1 + T)` to `m` before
-   subtracting `x_t = m`, so it is lost below half an ulp of `|m|` (`T < 2^-20` at
-   `|m| ~ 16`) even without (1).
-3. Backward: `scaled_softmax` is BF16 and `subtract_at_target` subtracts `1/N` after that
-   rounding, the same `bf16(p_t s) - s` collapse as the old single-device kernel.
-
-Fix outline: per shard, the online statistics give (local maximum, local first-maximum
-index offset by the shard's vocabulary start, local tail without it). All-gather the
-triples across the TP axis (three FP32 values per row, as the row-split exchange here
-does across cores) and repeat the lane combine with shards as lanes, taking the first
-maximum on the lowest shard index. The shard owning the target emits
-`loss = -((x_t - M) - log1p(T))`; backward is purely local with the substitution above
-on the target's shard. The device-side combine and gather are already written (the
-chunk combine in `kernels/compute/log_softmax.cpp`); the remaining work is a CCL
-all-gather of the per-row records and a mesh-aware program factory.
+Done: see [VOCAB_PARALLEL_CE_COLLAPSE.md](VOCAB_PARALLEL_CE_COLLAPSE.md). The old composite collapsed (every
+confident loss and target gradient exactly 0 from a gap of 8 on a Wormhole n300 TP2 mesh); it now runs three
+vocabulary-parallel kinds of the same row-softmax program with one all-gather of per-shard FP32 records.
 
 ### Section 3: teacher/student cancellation (GRPO log-prob ratio)
 

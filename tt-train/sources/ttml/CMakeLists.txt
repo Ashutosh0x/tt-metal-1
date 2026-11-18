@@ -257,6 +257,7 @@ set(METAL_OPS_FILES
     # Collapse-resistant fused log_softmax
     ${CMAKE_CURRENT_SOURCE_DIR}/metal/ops/log_softmax/log_softmax.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/metal/ops/log_softmax/row_softmax_program.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/metal/ops/log_softmax/vocab_parallel_cross_entropy.cpp
 )
 
 list(APPEND SOURCES ${METAL_OPS_FILES})

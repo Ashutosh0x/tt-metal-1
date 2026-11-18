@@ -28,7 +28,7 @@ constexpr uint32_t scaler_bits = get_compile_time_arg_val(1);  // Cross-entropy 
 constexpr uint32_t cx = 0, cdy = 1, ccols = 2, cm = 3, cs = 4, cic = 5, ci = 6, cmax = 7, cstateout = 8, cstatein = 9,
                    cpivot = 10, ctail = 11, cd = 12, cnorm = 13, csum = 14, cothers = 15, cout = 16, cpart0 = 17,
                    cpart1 = 18, cpart2 = 19, cpivotdy = 20, cpivotgrad = 21, cpartout = 23, ctargetx = 25,
-                   cfirstcol = 27, cupstream = 29;
+                   cfirstcol = 27, cupstream = 29, crecords = 31;
 
 inline void load(uint32_t cb, uint32_t tile, uint32_t dst) {
     reconfig_data_format_srca(cb);
@@ -91,11 +91,12 @@ inline void broadcast_col(uint32_t cb, uint32_t index, uint32_t out) {
     pack_one(0, out);
 }
 
-#if !defined(BACKWARD) || defined(CROSS_ENTROPY)
+#if !defined(BACKWARD) || defined(CROSS_ENTROPY) || defined(VP_COMBINE)
 // Combines 32 lanes of (maximum m, absolute first-maximum index i, tail t) per row into the row's
 // maximum (cmax), first maximum index (cpivot) and tail excluding exactly that element (ctail):
 //   M = max m;  K = min{i : m == M};  T = sum over lanes of t * exp(m - M) + [lane not K] exp(m - M).
-// Lanes are either SFPU lanes of one core or, after the exchange, the cores sharing a row.
+// Lanes are either SFPU lanes of one core or, after the exchange, the cores sharing a row, or (VP_COMBINE) the
+// vocabulary shards of a row, with global first-maximum indices.
 inline void combine(uint32_t cb_m, uint32_t cb_i, uint32_t cb_t) {
     tile_regs_acquire();
     load(cb_m, 0, 0);
@@ -133,8 +134,22 @@ inline void combine(uint32_t cb_m, uint32_t cb_i, uint32_t cb_t) {
     cb_pop_front(cd, 1);
 }
 
+// log1p of the combined tail: ctail -> cnorm, accurate however small the tail (Eq. 6).
+inline void log_normalizer() {
+    tile_regs_acquire();
+    load(ctail, 0, 0);
+    log1p_tile_init<false>();
+    log1p_tile<false>(0);
+    pack_one(0, cnorm);
+    cb_pop_front(ctail, 1);
+    cb_wait_front(cnorm, 1);
+}
+#endif
+
+#if !defined(BACKWARD) || defined(CROSS_ENTROPY)
 // Pass 1 and the lane (and chunk) combine. Leaves the row maximum (cmax), first-maximum index (cpivot) and
-// log1p(tail) (cnorm) at the front of their buffers, each a column vector.
+// log1p(tail) (cnorm) at the front of their buffers, each a column vector. VP_STATS stops before the log1p and
+// leaves the raw tail (ctail) instead, to be combined across shards.
 inline void row_statistics(uint32_t begin, uint32_t end) {
     // Pass 1: online per-lane maximum, first-maximum tile column and rescaled tail.
     {
@@ -203,19 +218,14 @@ inline void row_statistics(uint32_t begin, uint32_t end) {
             cb_pop_front(cpart1, 1);
             cb_pop_front(cpart2, 1);
         }
-        tile_regs_acquire();
-        load(ctail, 0, 0);
-        log1p_tile_init<false>();
-        log1p_tile<false>(0);
-        pack_one(0, cnorm);
-        cb_pop_front(ctail, 1);
-        cb_wait_front(cnorm, 1);
+#ifndef VP_STATS
+        log_normalizer();
+#endif
     }
 }
 #endif
 
-
-#ifdef CROSS_ENTROPY
+#if defined(CROSS_ENTROPY) || defined(VP_COMBINE)
 // Loss of each row from its target logit x_t (column 0 of ctargetx; zero for an out-of-range target):
 // -y_t with y_t = (x_t - m) - log1p(tail), computed exactly as the log_softmax output. When the target is
 // the selected maximum, x_t - m = 0 and the loss is log1p(tail) itself, however small.
@@ -291,7 +301,9 @@ inline void cross_entropy_grad_rows(uint32_t begin, uint32_t end) {
         cb_pop_front(ctargetx, 1);
         broadcast_col(cmax, 0, cm);
         cb_pop_front(cmax, 1);
+#ifndef VP_BACKWARD
         cb_pop_front(cpivot, 1);
+#endif
         cb_pop_front(cnorm, 1);
         cb_wait_front(cm, 1);
         cb_wait_front(cs, 1);
@@ -313,15 +325,65 @@ inline void cross_entropy_grad_rows(uint32_t begin, uint32_t end) {
 }
 #endif
 
+#ifdef VP_STATS
+// This shard's record of a row: (m, first_v + k, tail without x[k], x_t), each a column vector, for the writer.
+inline void vocab_parallel_record(uint32_t first_v_bits) {
+    cb_wait_front(ctargetx, 1);
+    tile_regs_acquire();
+    load(cmax, 0, 0);
+    load(cpivot, 0, 1);
+    binop_with_scalar_tile_init();
+    add_unary_tile(1, first_v_bits);
+    load(ctail, 0, 2);
+    load(ctargetx, 0, 3);
+    pack_n(crecords, 4);
+    cb_pop_front(cmax, 1);
+    cb_pop_front(cpivot, 1);
+    cb_pop_front(ctail, 1);
+    cb_pop_front(ctargetx, 1);
+}
+#endif
+
+#ifdef VP_COMBINE
+// The shards of a row as lanes: one global first maximum K (lowest shard on ties), the tail without exactly
+// x[K], l = log1p(tail). Hands the row state (M, l) to the writer, then the loss -((x_t - M) - l).
+inline void vocab_parallel_combine() {
+    cb_wait_front(cpart0, 1);
+    cb_wait_front(cpart1, 1);
+    cb_wait_front(cpart2, 1);
+    combine(cpart0, cpart1, cpart2);
+    cb_pop_front(cpart0, 1);
+    cb_pop_front(cpart1, 1);
+    cb_pop_front(cpart2, 1);
+    log_normalizer();
+    tile_regs_acquire();
+    load(cmax, 0, 0);
+    load(cnorm, 0, 1);
+    pack_n(crecords, 2);
+    cross_entropy_loss();
+}
+#endif
+
 void kernel_main() {
     const uint32_t count = get_arg_val<uint32_t>(0), begin = get_arg_val<uint32_t>(1), end = get_arg_val<uint32_t>(2);
+    [[maybe_unused]] const uint32_t first_v_bits = get_arg_val<uint32_t>(3);
     compute_kernel_hw_startup(cx, cx, cout);
     cb_wait_front(ccols, 1);
-#if defined(CROSS_ENTROPY) && !defined(BACKWARD)
+#if (defined(CROSS_ENTROPY) && !defined(BACKWARD)) || defined(VP_COMBINE)
     cb_wait_front(cfirstcol, 1);
 #endif
     for (uint32_t row = 0; row < count; ++row) {
-#if defined(CROSS_ENTROPY)
+#if defined(VP_COMBINE)
+        vocab_parallel_combine();
+#elif defined(VP_STATS)
+        row_statistics(begin, end);
+        vocab_parallel_record(first_v_bits);
+#elif defined(VP_BACKWARD)
+        // Row state (M, l) of the combined statistics, from the reader.
+        cb_wait_front(cmax, 1);
+        cb_wait_front(cnorm, 1);
+        cross_entropy_grad_rows(begin, end);
+#elif defined(CROSS_ENTROPY)
         row_statistics(begin, end);
 #ifndef BACKWARD
         cross_entropy_loss();
@@ -469,7 +531,7 @@ void kernel_main() {
         cb_pop_front(cstatein, 3);
 #endif
     }
-#if defined(CROSS_ENTROPY) && !defined(BACKWARD)
+#if (defined(CROSS_ENTROPY) && !defined(BACKWARD)) || defined(VP_COMBINE)
     cb_pop_front(cfirstcol, 1);
 #endif
     cb_pop_front(ccols, 1);

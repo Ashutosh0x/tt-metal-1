@@ -20,9 +20,27 @@
 //   CrossEntropyForward:  loss = -((x[t] - m) - l), one value per row.
 //   CrossEntropyBackward: dx = s * softmax(x), with dx[t] = s * expm1((x[t] - m) - l), where s is the scaler
 //                         times the row's upstream gradient when one is given.
+//
+// Vocabulary-parallel cross-entropy (the vocabulary sharded across TP devices, shard r owning global columns
+// [first_v, first_v + width) with first_v = r * width):
+//   VocabParallelStats:    per shard and row, one FP32 tile row with columns (m, first_v + k, tail without
+//                          x[k], x[t] or 0 when the target is on another shard): no log1p, no output tensor.
+//   VocabParallelCombine:  input = those tiles all-gathered along the last axis ([.., 32 * shards]); combines
+//                          the shards as lanes (one global first maximum, lowest shard on ties), l = log1p(T),
+//                          loss = -((x[t] - M) - l) per row and the row state (M, l) as two column-vector tiles.
+//   VocabParallelBackward: dx = s * exp(x - M - l) from that state, no statistics pass; the target's shard
+//                          substitutes dx[t] = s * expm1((x[t] - M) - l) (Eq. 7 in closed form when t = k).
 namespace ttml::metal::row_softmax {
 
-enum class Kind : uint8_t { LogSoftmaxForward, LogSoftmaxBackward, CrossEntropyForward, CrossEntropyBackward };
+enum class Kind : uint8_t {
+    LogSoftmaxForward,
+    LogSoftmaxBackward,
+    CrossEntropyForward,
+    CrossEntropyBackward,
+    VocabParallelStats,
+    VocabParallelCombine,
+    VocabParallelBackward,
+};
 
 // Work split. A unit is one row of 32 physical rows; with few rows, each row's columns are split over
 // `chunks` cores that exchange partial statistics.
@@ -32,7 +50,9 @@ struct Layout {
     uint32_t chunks;  // Cores sharing one row.
     uint32_t chunk_tiles;
 };
-Layout layout_for(const ttnn::Tensor& input);
+Layout layout_for(const ttnn::Tensor& input, Kind kind = Kind::LogSoftmaxForward);
+// Whether the program exchanges partial statistics between the cores sharing a row (and needs a scratch).
+bool needs_exchange(const Layout& layout, Kind kind);
 
 // DRAM scratch for the exchange: one page per (row, chunk) unit. Only needed when chunks > 1.
 tt::tt_metal::TensorSpec scratch_spec(const Layout& layout);
@@ -46,6 +66,7 @@ struct Options {
     uint32_t upstream_kind = 0;
     uint32_t target_page_bytes = 0;                            // Cross-entropy: bytes in one target page.
     uint32_t target_tiled_height = 0;                          // Cross-entropy: tile rows per target page.
+    uint32_t first_v = 0;  // Vocabulary-parallel stats/backward: global column of this shard's first column.
 };
 
 // Buffers the program reads and writes. Null entries are unused by the kind; a null scratch aliases
