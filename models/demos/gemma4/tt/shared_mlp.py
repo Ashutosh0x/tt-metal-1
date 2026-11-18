@@ -41,6 +41,11 @@ _DRAM_SHARD_MLP = os.environ.get("GEMMA4_MLP_DRAM_SHARD", "1") != "0"
 # a P150 (26B-A4B TP=4, trace replay): gate_up 43 -> 19 us, down 25 -> 16 us, same HiFi2 numerics.
 _MLP_GATE_UP_BLOCK_W = int(os.environ.get("GEMMA4_MLP_GATE_UP_BLOCK_W", "8"))  # env overrides for the K-block sweep
 _MLP_DOWN_BLOCK_W = int(os.environ.get("GEMMA4_MLP_DOWN_BLOCK_W", "32"))
+# GEMMA4_MLP_GEGLU_PREFILL (default 1): on prefill rows the GELU of the gate runs inside the multiply (binary_ng's
+# input-a activation: the same SFPU GELU on a 16-bit dest, packed to bf16, then the FPU product) instead of as a
+# separate unary program; bitwise the composite (one Galaxy chip, 12B TP4 [4096, 2 x 3840]: 810 -> 671 us per call
+# with the two slices; 26B [4096, 2 x 544]: 180 -> 109 us). 0 keeps the separate gelu.
+_MLP_GEGLU_PREFILL = os.environ.get("GEMMA4_MLP_GEGLU_PREFILL", "1") != "0"
 
 
 def resolve_shared_mlp_intermediate_size(hf_config, state_dict=None, layer_idx=None) -> int:
@@ -340,8 +345,15 @@ class SharedMLP:
 
             # Prefer Accurate over FastLut/Tanh for device PCC (see compute_config): the Tanh variant
             # dropped the E4B full-model PCC from 0.9846 to 0.9578 (gate 0.96) on bh_quietbox_2.
-            gate = ttnn.gelu(gate, variant=gelu_variant())
-            hidden = ttnn.mul(gate, up)
+            if _MLP_GEGLU_PREFILL and prefill and gelu_variant() == ttnn.GeluVariant.Accurate:
+                # GEMMA4_MLP_GEGLU_PREFILL: the Accurate GELU (UnaryOpType.GELU, param 0) as the multiply's input-a
+                # activation, bitwise the separate gelu program
+                hidden = ttnn.mul(
+                    gate, up, input_tensor_a_activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.GELU, 0.0)]
+                )
+            else:
+                gate = ttnn.gelu(gate, variant=gelu_variant())
+                hidden = ttnn.mul(gate, up)
             gate.deallocate(True)
             up.deallocate(True)
 
