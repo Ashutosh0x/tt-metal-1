@@ -156,6 +156,10 @@ void TensorAccessorArgs::update_args_config() {
 
     if (buffer_->buffer_distribution_spec().has_value()) {
         args_config_.set(tensor_accessor::ArgConfig::Sharded);
+        // The device-side TensorAccessorArgs rejects this combination only when the kernel is compiled.
+        TT_FATAL(
+            !args_config_.test(tensor_accessor::ArgConfig::RuntimePageSize),
+            "RuntimePageSize is not supported for a sharded buffer");
     } else {
         args_config_ = tensor_accessor::ArgConfig::None;
     }
