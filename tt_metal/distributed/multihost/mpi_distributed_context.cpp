@@ -255,6 +255,8 @@ static std::vector<pid_t> own_leftover_processes() {
     return out;
 }
 
+// TODO(teardown P24, CI): on two CI heads the helper outlived the rank and tt-run's backstop ended it, while both
+// P24 rows pass on the sandbox; the log line below is the first diagnostic from a CI rank (run 44219417923).
 static void end_own_process_group() {
     auto leftovers = own_leftover_processes();
     if (leftovers.empty()) {
@@ -341,6 +343,9 @@ static void sweep_stale_singleton_dirs(const std::filesystem::path& base) {
     }
 }
 
+// TODO(teardown, timeout centralisation): read this through rtoptions (get_timeout_duration_for_operations) like
+// dispatch and the topology mapper do, so SetOperationTimeout at runtime reaches the context too; same for the init
+// timeout below (a new rtoptions entry). The env var stays the input.
 static double operation_timeout_seconds() {
     const char* v = std::getenv("TT_METAL_OPERATION_TIMEOUT_SECONDS");
     if (v == nullptr || *v == '\0') {
@@ -433,6 +438,7 @@ const std::string& MPIDistributedException::error_string() const noexcept { retu
 
 Status MPIRequest::wait() {
     MPI_Status status{};
+    // TODO(teardown): the async handles wait blindly; poll with MPI_Test like wait_or_abort (timeout, SIGTERM).
     MPI_CHECK(MPI_Wait(&req_, &status));
     done_ = true;
 
@@ -784,6 +790,8 @@ void MPIContext::send(ttsl::Span<std::byte> buf, Rank dest, Tag tag) const {
 
 void MPIContext::ssend(ttsl::Span<std::byte> buf, Rank dest, Tag tag) const {
     check_size_fits_int(buf.size());
+    // TODO(teardown): a blind wait. Use MPI_Issend + wait_or_abort so this honours the operation timeout and returns
+    // on SIGTERM like barrier/send/recv/all_gather do (row to add in teardown_sanity).
     MPI_CHECK(MPI_Ssend(buf.data(), static_cast<int>(buf.size()), MPI_CHAR, *dest, *tag, comm_));
 }
 
@@ -813,6 +821,7 @@ RequestPtr MPIContext::irecv(ttsl::Span<std::byte> buf, Rank src, Tag tag) const
 
 void MPIContext::broadcast(ttsl::Span<std::byte> buf, Rank root) const {
     check_size_fits_int(buf.size());
+    // TODO(teardown): a blind wait. MPI_Ibcast + wait_or_abort (operation timeout, SIGTERM); row to add.
     MPI_CHECK(MPI_Bcast(buf.data(), static_cast<int>(buf.size()), MPI_CHAR, *root, comm_));
 }
 
@@ -838,6 +847,7 @@ void MPIContext::all_reduce(
     // allow in‑place (send == recv) by switching to MPI_IN_PLACE
     void* send_ptr = (send_buf.data() == recv_buf.data()) ? MPI_IN_PLACE : static_cast<void*>(send_buf.data());
 
+    // TODO(teardown): a blind wait. MPI_Iallreduce + wait_or_abort; row to add.
     MPI_CHECK(MPI_Allreduce(send_ptr, recv_buf.data(), count, dtype_to_mpi(dtype), reduce_to_mpi(op), comm_));
 }
 
@@ -864,6 +874,7 @@ void MPIContext::reduce(
 
     void* send_ptr = (send_buf.data() == recv_buf.data()) ? MPI_IN_PLACE : send_buf.data();
 
+    // TODO(teardown): a blind wait. MPI_Ireduce + wait_or_abort; row to add.
     MPI_CHECK(MPI_Reduce(send_ptr, recv_buf.data(), count, dtype_to_mpi(dtype), reduce_to_mpi(op), *root, comm_));
 }
 
@@ -878,6 +889,7 @@ void MPIContext::gather(ttsl::Span<std::byte> send_buf, ttsl::Span<std::byte> re
             recv_buf.size() == expected, "gather: root recv buffer {} bytes, expected {}", recv_buf.size(), expected);
     }
 
+    // TODO(teardown): a blind wait. MPI_Igather + wait_or_abort; row to add.
     MPI_CHECK(MPI_Gather(send_buf.data(), send_count, MPI_CHAR, recv_buf.data(), send_count, MPI_CHAR, *root, comm_));
 }
 
@@ -891,6 +903,7 @@ void MPIContext::scatter(ttsl::Span<std::byte> send_buf, ttsl::Span<std::byte> r
             send_buf.size() == expected, "scatter: root send buffer {} bytes, expected {}", send_buf.size(), expected);
     }
 
+    // TODO(teardown): a blind wait. MPI_Iscatter + wait_or_abort; row to add.
     MPI_CHECK(MPI_Scatter(send_buf.data(), recv_count, MPI_CHAR, recv_buf.data(), recv_count, MPI_CHAR, *root, comm_));
 }
 
@@ -933,6 +946,7 @@ void MPIContext::all_to_all(ttsl::Span<std::byte> send_buf, ttsl::Span<std::byte
     const int block = static_cast<int>(send_buf.size() / world);
     check_size_fits_int(block);
 
+    // TODO(teardown): a blind wait. MPI_Ialltoall + wait_or_abort; row to add.
     MPI_CHECK(MPI_Alltoall(send_buf.data(), block, MPI_CHAR, recv_buf.data(), block, MPI_CHAR, comm_));
 }
 
@@ -992,12 +1006,15 @@ void MPIContext::scan(ttsl::Span<std::byte> send_buf, ttsl::Span<std::byte> recv
 
     void* send_ptr = (send_buf.data() == recv_buf.data()) ? MPI_IN_PLACE : send_buf.data();
 
+    // TODO(teardown): a blind wait. MPI_Iscan + wait_or_abort; row to add.
     MPI_CHECK(MPI_Scan(send_ptr, recv_buf.data(), count, dtype_to_mpi(dtype), reduce_to_mpi(op), comm_));
 }
 /* ---- communicator management ------------------------------------------ */
 
 ContextPtr MPIContext::duplicate() const {
     MPI_Comm dup = MPI_COMM_NULL;
+    // TODO(teardown): a blind wait. MPI_Comm_idup + wait_or_abort; MPI_Comm_split has no non-blocking form, document
+    // it.
     MPI_CHECK(MPI_Comm_dup(comm_, &dup));
     return std::make_shared<MPIContext>(dup);
 }
@@ -1044,6 +1061,10 @@ void MPIContext::translate_ranks_to_other_ctx(
         group_, static_cast<int>(ranks.size()), ranks.data(), mpi_context->group(), translated_ranks.data()));
 }
 
+// TODO(teardown): add DistributedContext::exit(code) for C++ ranks: a non-zero exit() runs the atexit MPI_Finalize
+// fence (an atexit handler cannot see the exit code), so a C++ program that exits 1 hangs its peers the way P26 did
+// for Python. exit(code) aborts when code != 0 and the job has peers; generate_rank_bindings and the fabric tests use
+// it.
 void MPIContext::abort(int error_code) const {
     if (g_launched) {
         end_own_process_group();  // P24: the abort path ends this rank's helpers too

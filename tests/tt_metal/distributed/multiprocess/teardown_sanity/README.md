@@ -161,3 +161,18 @@ group (Part 1, D) runs on the SC4 lane, added in the base PR; the stacked PR add
 group (Part 2, H) on the same lane. Deadlines: `TT_SANITY_DEADLINE` (a row that must end) and
 `TT_SANITY_DEADLINE_HANG` (a row that hangs today). `TT_SANITY_MPI_PREFIX=/opt/openmpi-<version>` reruns the MPI
 rows, install group E included, against another install.
+
+## Open items (TODO)
+
+- **Decision, P30:** no timeout is on by default; `test_hang_without_any_timeout` is a strict xfail until either tt-run
+  gets per-job timeout options (operation, init, job wall clock) or the opt-in is written down as the rule.
+- **P33:** `test_ttrun_dead_peer_survivors_abort` (#65121) meets openpmix/prrte#2815 on PRRTE 3.0.8; the tt-run
+  banner-keyed safeguard (#65121, in progress) makes it a hard gate; the image move past 3.0.8 is the root fix.
+- **P24 in CI:** both P24 rows pass locally; on two CI heads the helper outlived the rank. The rank's sweep now logs
+  the pids it ends; the first CI run with that line is 44219417923.
+- **Group H never run:** `run_teardown_multihost_context_tests.sh` (three cross-host cases) needs two hosts: the SC4
+  lane, or a two-node Slurm job.
+- **R5 on hardware:** cluster validation, ethernet retrain, tt-smi reset, firmware back at base: no run yet.
+- **Code:** the collectives that still wait blindly (`ssend`, `broadcast`, `reduce`, `all_reduce`, `gather`,
+  `scatter`, `all_to_all`, `scan`, `MPIRequest::wait`, `dup`), `DistributedContext::exit(code)` for C++ ranks,
+  SIGTERM for pure C++ ranks, the operation timeout read through rtoptions. Each has a `TODO(teardown ...)` at the line.

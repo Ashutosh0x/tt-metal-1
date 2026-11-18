@@ -24,6 +24,9 @@ extern "C" void on_sigterm(int signal_number) {
     if ((g_previous_sigterm.sa_flags & SA_SIGINFO) != 0) {
         return;  // a siginfo handler we cannot call with what we have; the flag is set, which is what matters
     }
+    // TODO(teardown P28, C++ ranks): with the default disposition the rank still dies without closing its device.
+    // Generalise simulator_termination.cpp's exit-through-atexit thread (std::exit(128 + signal) from a woken thread)
+    // to launched ranks, so MetalContext's teardown runs; planned together with the simulator work.
     if (g_previous_sigterm.sa_handler == SIG_DFL) {
         (void)::sigaction(signal_number, &g_previous_sigterm, nullptr);
         ::raise(signal_number);  // the process ends as it would have without us
