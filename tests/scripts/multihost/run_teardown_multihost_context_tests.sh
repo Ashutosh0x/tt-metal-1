@@ -51,11 +51,22 @@ FAIL=0
 # node), not through --hosts. No PRRTE --timeout on purpose: the hang case must be bounded by the context's own
 # timeout, not the launcher wall clock. One rank per host so rank 1 is genuinely remote.
 BINDING="$ROOT/tests/tt_metal/distributed/config/dual_bh_galaxy_rank_binding.yaml"
+# Placement: tt-run's legacy mode emits one app context per rank, and "--map-by node" maps each context from the
+# first host, so both ranks land on host 1 (seen on two LoudBox nodes under Slurm). A rankfile pins rank 0 to the
+# first host and rank 1 to the second. The interface the ranks' TCP transport uses comes from TT_SANITY_TCP_INTERFACE
+# when set (tt-run's --tcp-interface, which replaces its default docker0,lo exclude; the two must not be mixed).
+cd "$ROOT"
+mkdir -p generated/teardown_sanity
+RANKFILE="generated/teardown_sanity/rankfile_$$"
+printf 'rank 0=%s slot=0\nrank 1=%s slot=0\n' "$(cut -d, -f1 <<<"$HOSTS")" "$(cut -d, -f2 <<<"$HOSTS")" > "$RANKFILE"
+TCP_IF_ARGS=()
+[ -n "${TT_SANITY_TCP_INTERFACE:-}" ] && TCP_IF_ARGS=(--tcp-interface "$TT_SANITY_TCP_INTERFACE")
 run_probe() { # extra "KEY=VAL ..." env
   env "$@" timeout 180 "$TTRUN" \
     --rank-binding "$BINDING" \
     --mock-cluster-rank-binding "$MAPPING" \
-    --mpi-args "$MPI_ARGS --host $HOSTS --map-by node" \
+    "${TCP_IF_ARGS[@]}" \
+    --mpi-args "$MPI_ARGS --host $HOSTS --map-by rankfile:file=$RANKFILE" \
     "$PY" "$PROBE"
 }
 
@@ -100,5 +111,6 @@ run_probe PROBE_COLL=allgather_skip PROBE_VICTIM="$VICTIM" TT_METAL_OPERATION_TI
 check "context_multihost_remote_hang_timeout" 1 "$rc" 60 $((SECONDS - t0))
 
 reap
+rm -f "$RANKFILE"
 [ "$FAIL" -eq 0 ] && echo "=== teardown context multihost: all cases passed" || echo "=== teardown context multihost: FAILURES above"
 exit "$FAIL"
