@@ -103,6 +103,24 @@ void append_sharded_args(
         }
     }
 }
+
+void append_interleaved_args(
+    const Buffer* buffer, tensor_accessor::ArgsConfig args_config, std::vector<uint32_t>& args, bool is_runtime) {
+    if (!is_runtime) {
+        args.push_back(args_config.raw());
+    }
+    // The aligned page size is a compile-time arg, or a common runtime arg under RuntimePageSize.
+    if (args_config.test(tensor_accessor::ArgConfig::RuntimePageSize) != is_runtime) {
+        return;
+    }
+    auto aligned_page_size = buffer ? buffer->aligned_page_size() : 0;
+    TT_FATAL(
+        aligned_page_size <= std::numeric_limits<uint32_t>::max(),
+        "Aligned page size {} exceeds uint32_t max {}",
+        aligned_page_size,
+        std::numeric_limits<uint32_t>::max());
+    args.push_back(static_cast<uint32_t>(aligned_page_size));
+}
 }  // namespace CMAKE_UNIQUE_NAMESPACE
 }  // namespace
 
@@ -167,7 +185,8 @@ void TensorAccessorArgs::update_args_config() {
             !args_config_.test(tensor_accessor::ArgConfig::RuntimePageSize),
             "RuntimePageSize is not supported for a sharded buffer");
     } else {
-        args_config_ = tensor_accessor::ArgConfig::None;
+        // An interleaved buffer can take only its page size at runtime.
+        args_config_ = args_config_ & tensor_accessor::ArgConfig::RuntimePageSize;
     }
     args_config_.set(tensor_accessor::ArgConfig::IsDram, buffer_->is_dram());
 
@@ -190,14 +209,10 @@ void TensorAccessorArgs::append_to(
         CMAKE_UNIQUE_NAMESPACE::append_sharded_args(*buffer_, args_config_, compile_time_args, /* is_runtime */ false);
         CMAKE_UNIQUE_NAMESPACE::append_sharded_args(*buffer_, args_config_, common_runtime_args, /* is_runtime */ true);
     } else {
-        compile_time_args.push_back(args_config_.raw());
-        auto aligned_page_size = buffer_ ? buffer_->aligned_page_size() : 0;
-        TT_FATAL(
-            aligned_page_size <= std::numeric_limits<uint32_t>::max(),
-            "Aligned page size {} exceeds uint32_t max {}",
-            aligned_page_size,
-            std::numeric_limits<uint32_t>::max());
-        compile_time_args.push_back(static_cast<uint32_t>(aligned_page_size));
+        CMAKE_UNIQUE_NAMESPACE::append_interleaved_args(
+            buffer_, args_config_, compile_time_args, /* is_runtime */ false);
+        CMAKE_UNIQUE_NAMESPACE::append_interleaved_args(
+            buffer_, args_config_, common_runtime_args, /* is_runtime */ true);
     }
 }
 
@@ -209,14 +224,8 @@ void TensorAccessorArgs::append_to(std::vector<uint32_t>& compile_time_args) con
     if (args_config_.test(tensor_accessor::ArgConfig::Sharded)) {
         CMAKE_UNIQUE_NAMESPACE::append_sharded_args(*buffer_, args_config_, compile_time_args, /* is_runtime */ false);
     } else {
-        compile_time_args.push_back(args_config_.raw());
-        auto aligned_page_size = buffer_ ? buffer_->aligned_page_size() : 0;
-        TT_FATAL(
-            aligned_page_size <= std::numeric_limits<uint32_t>::max(),
-            "Aligned page size {} exceeds uint32_t max {}",
-            aligned_page_size,
-            std::numeric_limits<uint32_t>::max());
-        compile_time_args.push_back(static_cast<uint32_t>(aligned_page_size));
+        CMAKE_UNIQUE_NAMESPACE::append_interleaved_args(
+            buffer_, args_config_, compile_time_args, /* is_runtime */ false);
     }
 }
 
@@ -225,14 +234,8 @@ std::vector<uint32_t> TensorAccessorArgs::get_compile_time_args() const {
     if (args_config_.test(tensor_accessor::ArgConfig::Sharded)) {
         CMAKE_UNIQUE_NAMESPACE::append_sharded_args(*buffer_, args_config_, compile_time_args, /* is_runtime */ false);
     } else {
-        compile_time_args.push_back(args_config_.raw());
-        auto aligned_page_size = buffer_ ? buffer_->aligned_page_size() : 0;
-        TT_FATAL(
-            aligned_page_size <= std::numeric_limits<uint32_t>::max(),
-            "Aligned page size {} exceeds uint32_t max {}",
-            aligned_page_size,
-            std::numeric_limits<uint32_t>::max());
-        compile_time_args.push_back(static_cast<uint32_t>(aligned_page_size));
+        CMAKE_UNIQUE_NAMESPACE::append_interleaved_args(
+            buffer_, args_config_, compile_time_args, /* is_runtime */ false);
     }
     return compile_time_args;
 }
@@ -241,6 +244,9 @@ std::vector<uint32_t> TensorAccessorArgs::get_common_runtime_args() const {
     std::vector<uint32_t> common_runtime_args;
     if (args_config_.test(tensor_accessor::ArgConfig::Sharded)) {
         CMAKE_UNIQUE_NAMESPACE::append_sharded_args(*buffer_, args_config_, common_runtime_args, /* is_runtime */ true);
+    } else {
+        CMAKE_UNIQUE_NAMESPACE::append_interleaved_args(
+            buffer_, args_config_, common_runtime_args, /* is_runtime */ true);
     }
     return common_runtime_args;
 }
