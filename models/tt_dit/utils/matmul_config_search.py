@@ -687,19 +687,33 @@ def _jobs(results: Results, wanted: Iterable[Key], suspects: set[Key]) -> list[J
     return [Job(kind, rows, configs, alone) for (kind, rows, alone), configs in sorted(groups.items())]
 
 
-def _split_jobs(jobs: list[Job], n: int) -> list[list[Job]]:
-    """The jobs split into `n` shares, each config of a kind in one share only, so that it is
-    compiled once. A kind's configs are dealt round robin, which balances the shares."""
+def _split_jobs(jobs: list[Job], n: int, compiled: set[tuple[Kind, Config]]) -> list[list[Job]]:
+    """The jobs split into `n` shares.
+
+    A config not measured before is in one share only, so that it is compiled once; a kind's new
+    configs are dealt round robin. A config measured before is in the kernel cache on disk, so
+    its points are dealt by job instead: a job keeps all of them, and every job costs a worker the
+    same to set up (its inputs and a profiler read) however few configs it times.
+    """
     share_of: dict[tuple[Kind, Config], int] = {}
     for kind in sorted({j.kind for j in jobs}):
-        configs = sorted({c for j in jobs if j.kind == kind for c in j.configs}, key=Config.as_tuple)
-        share_of.update({(kind, c): i % n for i, c in enumerate(configs)})
+        new = sorted(
+            {c for j in jobs if j.kind == kind for c in j.configs if (kind, c) not in compiled}, key=Config.as_tuple
+        )
+        share_of.update({(kind, c): i % n for i, c in enumerate(new)})
     shares: list[list[Job]] = [[] for _ in range(n)]
+    sizes = [0] * n
     for j in jobs:
+        old = [c for c in j.configs if (j.kind, c) not in share_of]
+        if old:
+            i = sizes.index(min(sizes))  # the share with the fewest points so far
+            shares[i].append(Job(j.kind, j.rows, old, j.one_at_a_time))
+            sizes[i] += len(old)
         for i in range(n):
-            configs = [c for c in j.configs if share_of[(j.kind, c)] == i]
+            configs = [c for c in j.configs if share_of.get((j.kind, c)) == i]
             if configs:
                 shares[i].append(Job(j.kind, j.rows, configs, j.one_at_a_time))
+                sizes[i] += len(configs)
     return shares
 
 
@@ -719,7 +733,8 @@ def run_jobs(spec_path: Path, spec: Spec, db: Path, wanted: list[Key], devices: 
         print(f"{pending} points to measure", flush=True)
         for inflight in inflights.values():
             inflight.unlink(missing_ok=True)  # left by a driver that was stopped
-        shares = dict(zip(devices, _split_jobs(jobs, len(devices)), strict=True))
+        compiled = {(kind, config) for kind, _, config in results.done}
+        shares = dict(zip(devices, _split_jobs(jobs, len(devices), compiled), strict=True))
         shares = {d: share for d, share in shares.items() if share}
         job_files = {}
         try:
@@ -775,9 +790,7 @@ def _run_workers(args: dict[int, list[str]], inflights: dict[int, Path], arch: s
     With several devices, each worker sees only its own chip (`TT_VISIBLE_DEVICES`), since a
     process opening one chip of several starts and locks all it sees. A single Blackhole chip of a
     multi-chip card is then a custom cluster to tt-metal, which wants a mesh graph descriptor, the
-    one of a single chip. A lone worker sees every chip and opens its own among them, which works
-    where a chip cannot be opened on its own, as on a Wormhole Galaxy, whose chips run routing
-    firmware on their Ethernet cores.
+    one of a single chip. A lone worker sees every chip and opens its own among them.
 
     A worker writes its in-flight file before each batch and removes it after, so a worker whose
     file has not changed for WATCHDOG_SECONDS hangs and is stopped.
@@ -837,8 +850,6 @@ def _stop(*procs: subprocess.Popen) -> None:
 
 
 def _worker(spec_path: Path, jobs_path: Path, db: Path, inflight: Path, device_id: int) -> None:
-    import torch
-
     import ttnn
 
     spec = Spec.load(spec_path)
@@ -857,8 +868,9 @@ def _worker(spec_path: Path, jobs_path: Path, db: Path, inflight: Path, device_i
         programs, t0 = 0, time.time()
 
         def tensor(dtype: str, *shape: int) -> ttnn.Tensor:
-            return ttnn.from_torch(
-                torch.randn(shape), dtype=getattr(ttnn, dtype), layout=ttnn.TILE_LAYOUT, device=device
+            # On the device: a host tensor of 16k rows takes most of a second to make and copy.
+            return ttnn.rand(
+                list(shape), device=device, dtype=getattr(ttnn, dtype), layout=ttnn.TILE_LAYOUT, low=-1.0, high=1.0
             )
 
         weight, weight_key = None, None
@@ -876,6 +888,7 @@ def _worker(spec_path: Path, jobs_path: Path, db: Path, inflight: Path, device_i
                 inputs = [tensor(x, 1, 1, job.rows, K)]
             bias = tensor(kind.weight_dtype, 1, N) if kind.bias else None
             addcmul = (tensor(x, 1, 1, job.rows, N), tensor(x, 1, 1, 1, N)) if kind.op == "addcmul" else ()
+            _read_programs(ttnn, device)  # drops the programs that made the tensors from the profiler
             settings = (kind.math_fidelity, kind.math_approx_mode)
             if settings not in compute_configs:
                 compute_configs[settings] = ttnn.init_device_compute_kernel_config(
