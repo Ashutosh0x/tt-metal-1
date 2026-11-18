@@ -7,6 +7,7 @@
 #include <mpi.h>
 #include <mpi-ext.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -200,12 +201,15 @@ static void remove_singleton_session_dir() {
 // launcher kills a rank's whole process group on an abort but only reaps the rank on a clean exit, so a helper that
 // ignores SIGTERM lived on; tt-run's session sweep found it on the launch host only, and turned the clean job into a
 // failure. So the rank ends its own group itself, on the clean exit path and the abort path alike: every process in
-// the group this rank leads (PRRTE gives each rank its own) gets SIGTERM, a short grace, then SIGKILL. A rank that does
-// not lead its own group (not launched by PRRTE: a plain pytest, srun) owns nothing here and does nothing. The
-// simulators (TT_METAL_SIMULATOR) load in-process, so there is no simulator child to end.
-static std::vector<pid_t> own_group_members() {
+// the group this rank leads (PRRTE gives each rank its own) and every descendant gets SIGTERM, a short grace, then
+// SIGKILL. Only for a launched rank (g_launched); a plain pytest never runs it. The simulators (TT_METAL_SIMULATOR)
+// load in-process, so there is no simulator child to end.
+// What this rank left behind: every process in the group it leads (PRRTE gives each rank its own) and every
+// descendant (a helper forked through a wrapper that did not join the group, or when the rank itself sits inside a
+// wrapper's group). Read from /proc; the rank itself is never in the list.
+static std::vector<pid_t> own_leftover_processes() {
     const pid_t self = ::getpid();
-    std::vector<pid_t> out;
+    std::vector<std::pair<pid_t, pid_t>> parent_of;  // (pid, ppid)
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
         const std::string name = entry.path().filename().string();
@@ -213,31 +217,66 @@ static std::vector<pid_t> own_group_members() {
             continue;
         }
         const pid_t pid = static_cast<pid_t>(std::atoi(name.c_str()));
-        if (pid != self && ::getpgid(pid) == self) {
+        std::ifstream stat(entry.path() / "stat");
+        std::string line;
+        if (!std::getline(stat, line)) {
+            continue;
+        }
+        const auto close_paren = line.rfind(')');  // the comm field may hold spaces; ppid is the 4th field after it
+        if (close_paren == std::string::npos) {
+            continue;
+        }
+        std::istringstream rest(line.substr(close_paren + 1));
+        char state = 0;
+        long ppid = 0;
+        if (!(rest >> state >> ppid)) {
+            continue;
+        }
+        parent_of.emplace_back(pid, static_cast<pid_t>(ppid));
+    }
+    std::vector<pid_t> out;
+    auto listed = [&](pid_t pid) { return std::find(out.begin(), out.end(), pid) != out.end(); };
+    const pid_t group = ::getpgrp();
+    for (const auto& [pid, ppid] : parent_of) {
+        if (pid != self && group == self && ::getpgid(pid) == self && !listed(pid)) {
             out.push_back(pid);
+        }
+    }
+    bool grew = true;  // descendants: close the parent chain from this rank down
+    while (grew) {
+        grew = false;
+        for (const auto& [pid, ppid] : parent_of) {
+            if (pid != self && !listed(pid) && (ppid == self || listed(ppid))) {
+                out.push_back(pid);
+                grew = true;
+            }
         }
     }
     return out;
 }
 
 static void end_own_process_group() {
-    if (::getpgrp() != ::getpid()) {
+    auto leftovers = own_leftover_processes();
+    if (leftovers.empty()) {
         return;
     }
-    auto members = own_group_members();
-    if (members.empty()) {
-        return;
-    }
-    for (const pid_t pid : members) {
+    std::string pids;
+    for (const pid_t pid : leftovers) {
+        pids += (pids.empty() ? "" : " ") + std::to_string(pid);
         ::kill(pid, SIGTERM);
     }
+    std::fprintf(
+        stderr,
+        "[MPIContext] ending %zu process(es) this rank left behind before it exits (pids %s)\n",
+        leftovers.size(),
+        pids.c_str());
     for (int i = 0; i < 100; ++i) {  // 2 s grace
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        if (own_group_members().empty()) {
+        if (own_leftover_processes().empty()) {
             break;
         }
     }
-    for (const pid_t pid : own_group_members()) {
+    for (const pid_t pid : own_leftover_processes()) {
         ::kill(pid, SIGKILL);
     }
     while (::waitpid(-1, nullptr, WNOHANG) > 0) {  // reap what was ours, so the launcher counts nothing left
