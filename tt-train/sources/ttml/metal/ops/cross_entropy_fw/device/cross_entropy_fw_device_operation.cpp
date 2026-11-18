@@ -15,7 +15,22 @@ void CrossEntropyForwardDeviceOperation::validate_on_program_cache_miss(
     const auto& input_tensor = tensor_args.input;
     const auto& target_tensor = tensor_args.target;
     const auto& preallocated_output_tensor = tensor_args.preallocated_output;
-    check_device_tensor(input_tensor, "CrossEntropyForward", "Input");
+    check_device_tensor(
+        input_tensor,
+        "CrossEntropyForward",
+        "Input",
+        {.dtypes = {tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::DataType::FLOAT32},
+         .layout = tt::tt_metal::Layout::TILE,
+         .buffer_type = tt::tt_metal::BufferType::DRAM});
+    // The fused row-softmax program streams interleaved 32x32 tiles and keeps column indices as exact FP32.
+    TT_FATAL(
+        input_tensor.logical_shape().rank() == 4 && input_tensor.memory_config() == ttnn::DRAM_MEMORY_CONFIG &&
+            input_tensor.tensor_spec().tile().get_height() == 32 && input_tensor.tensor_spec().tile().get_width() == 32,
+        "CrossEntropyForward: input must be a rank-4 interleaved DRAM tensor of 32x32 tiles");
+    TT_FATAL(
+        input_tensor.logical_shape()[-1] > 0 && input_tensor.logical_shape()[-1] <= (1U << 24),
+        "CrossEntropyForward: vocabulary width must be in [1, 2^24], got {}",
+        input_tensor.logical_shape()[-1]);
     check_device_tensor(
         target_tensor,
         "CrossEntropyForward",

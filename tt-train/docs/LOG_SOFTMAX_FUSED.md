@@ -15,8 +15,9 @@ instead of subtracting nearly equal values. FP32 input and statistics use
 unpack-to-destination mode; routing them through the FPU copy truncates to TF32.
 
 Section 3's teacher/student cancellation needs a logits-aware loss; a log_softmax
-API returning rounded log-probabilities cannot provide it. Existing fused training
-losses are independent and are not changed here.
+API returning rounded log-probabilities cannot provide it. The fused cross-entropy used
+for training now shares this program (`row_softmax_program.{hpp,cpp}`); see
+[CROSS_ENTROPY_COLLAPSE.md](CROSS_ENTROPY_COLLAPSE.md).
 
 ## Kernel design (2026-11-17)
 
