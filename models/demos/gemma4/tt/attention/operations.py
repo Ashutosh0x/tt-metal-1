@@ -354,7 +354,19 @@ def prefill_sdpa_program_config(head_dim, seq_len, sliding_window=None, num_head
         and int(num_heads) < PREFILL_SDPA_WIDE_MIN_HEADS
         and is_blackhole()
     )
-    if narrow and device_grid is not None and os.environ.get("GEMMA4_PREFILL_SDPA_NARROW", "") == "wide":
+    narrow_mode = decode_flag("GEMMA4_PREFILL_SDPA_NARROW") if (narrow and device_grid is not None) else ""
+    if narrow_mode == "qwide":
+        # the op defaults' numerics (k = 32, the approximate exp the op takes without a program config, the whole
+        # grid) with 128 Q rows per work unit instead of 32: the Q chunk only partitions the rows (each row's
+        # online softmax walks the same 32-key chunks), so the output is bitwise the default's
+        q_n = max(32, min(128, seq_len)) // 32 * 32
+        return ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(*_fit(device_grid, device_grid)),
+            q_chunk_size=q_n,
+            k_chunk_size=32,
+            exp_approx_mode=True,
+        )
+    if narrow_mode == "wide":
         # opt-in A/B: the whole grid at q = k = 128 (window-capped) for the narrow chips (sliding square 4.32 -> 1.52 ms
         # on a Galaxy chip, 31B TP8 shape); accuracy-gated before any default
         k_cap = 128 if sliding_window is None else min(128, max(32, int(sliding_window) // 2))
