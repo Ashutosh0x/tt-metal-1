@@ -190,10 +190,10 @@ ResolvedTensorParameter ResolveTensorParameterStaticCTAs(
     // Non-DRAM coords are virtualized; DRAM coords are kept logical (DRAM bank id == logical x).
     const CoreType core_type = is_dram ? CoreType::DRAM : CoreType::WORKER;
     auto resolve_coord = [&](const CoreCoord& logical) -> CoreCoord {
-        if (is_dram) {
-            return logical;
-        }
-        return mesh_device.virtual_core_from_logical_core(logical, core_type);
+        const CoreCoord coord = is_dram ? logical : mesh_device.virtual_core_from_logical_core(logical, core_type);
+        // Each coordinate is packed into 8 bits.
+        TT_FATAL(coord.x <= 0xFF && coord.y <= 0xFF, "Bank coordinate {} does not fit into 8 bits", coord);
+        return coord;
     };
     for (size_t i = 0; i < n_banks; i += 2) {
         const CoreCoord c1 = resolve_coord(bank_coords[i]);
