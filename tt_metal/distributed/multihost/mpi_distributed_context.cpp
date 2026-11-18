@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <limits>
 #include <thread>
@@ -24,6 +25,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <tt_stl/assert.hpp>
@@ -184,12 +186,61 @@ bool was_mpi_finalized() noexcept {
 // the abort paths (MPIContext::abort, std::terminate) can clean up and decide whether there is anybody to abort for.
 static std::string g_singleton_session_dir;
 static int g_world_size = 0;
+static bool g_launched = false;  // started by a launcher (PRRTE/PMIx), so the rank leads its own process group
 
 static void remove_singleton_session_dir() {
     if (!g_singleton_session_dir.empty()) {
         std::error_code ec;
         std::filesystem::remove_all(g_singleton_session_dir, ec);
         g_singleton_session_dir.clear();
+    }
+}
+
+// Teardown plan P24: a helper this rank forked (a compile worker, a profiler capture) must not outlive the rank. The
+// launcher kills a rank's whole process group on an abort but only reaps the rank on a clean exit, so a helper that
+// ignores SIGTERM lived on; tt-run's session sweep found it on the launch host only, and turned the clean job into a
+// failure. So the rank ends its own group itself, on the clean exit path and the abort path alike: every process in
+// the group this rank leads (PRRTE gives each rank its own) gets SIGTERM, a short grace, then SIGKILL. A rank that does
+// not lead its own group (not launched by PRRTE: a plain pytest, srun) owns nothing here and does nothing. The
+// simulators (TT_METAL_SIMULATOR) load in-process, so there is no simulator child to end.
+static std::vector<pid_t> own_group_members() {
+    const pid_t self = ::getpid();
+    std::vector<pid_t> out;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
+        const std::string name = entry.path().filename().string();
+        if (name.empty() || name[0] < '0' || name[0] > '9') {
+            continue;
+        }
+        const pid_t pid = static_cast<pid_t>(std::atoi(name.c_str()));
+        if (pid != self && ::getpgid(pid) == self) {
+            out.push_back(pid);
+        }
+    }
+    return out;
+}
+
+static void end_own_process_group() {
+    if (::getpgrp() != ::getpid()) {
+        return;
+    }
+    auto members = own_group_members();
+    if (members.empty()) {
+        return;
+    }
+    for (const pid_t pid : members) {
+        ::kill(pid, SIGTERM);
+    }
+    for (int i = 0; i < 100; ++i) {  // 2 s grace
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (own_group_members().empty()) {
+            break;
+        }
+    }
+    for (const pid_t pid : own_group_members()) {
+        ::kill(pid, SIGKILL);
+    }
+    while (::waitpid(-1, nullptr, WNOHANG) > 0) {  // reap what was ours, so the launcher counts nothing left
     }
 }
 
@@ -281,11 +332,7 @@ static double distributed_init_timeout_seconds() {
 // job down (MPI_Abort, the P1 rule) rather than return locally and leave the peers hung; we also throw so the
 // caller's log names the stuck call. With the timeout unset this is a plain MPI_Wait.
 static void wait_or_abort(MPI_Comm comm, MPI_Request& req, const char* what) {
-    const double timeout = operation_timeout_seconds();
-    if (timeout <= 0.0) {
-        MPI_CHECK(MPI_Wait(&req, MPI_STATUS_IGNORE));
-        return;
-    }
+    const double timeout = operation_timeout_seconds();  // 0: no deadline, the wait is still a poll for the flag below
     const auto start = std::chrono::steady_clock::now();
     for (;;) {
         int flag = 0;
@@ -293,8 +340,19 @@ static void wait_or_abort(MPI_Comm comm, MPI_Request& req, const char* what) {
         if (flag != 0) {
             return;
         }
+        // Teardown plan P28: a rank that got SIGTERM is leaving now. Its collective returns on the signal itself
+        // (no clock): the request is dropped and the caller unwinds, closes its device, and ends the job.
+        if (DistributedContext::is_terminating()) {
+            int rank = 0;
+            MPI_Comm_rank(comm, &rank);
+            MPI_Cancel(&req);
+            MPI_Request_free(&req);
+            throw std::runtime_error(
+                "[MPIContext] rank " + std::to_string(rank) + ": " + what +
+                " abandoned, this rank is terminating on SIGTERM");
+        }
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        if (elapsed >= timeout) {
+        if (timeout > 0.0 && elapsed >= timeout) {
             int rank = 0;
             MPI_Comm_rank(comm, &rank);
             MPI_Cancel(&req);
@@ -458,6 +516,7 @@ inline void init_env(int& argc, char**& argv) {
             }
         }
 
+        g_launched = launched;
         if (launched) {
             // P25: one rank per host is enough; the local rank is PMIx/Open MPI's, 0 when absent.
             const char* local_rank = std::getenv("OMPI_COMM_WORLD_LOCAL_RANK");
@@ -484,7 +543,18 @@ inline void init_env(int& argc, char**& argv) {
         // What ends the job is the peers' side: with TT_METAL_OPERATION_TIMEOUT_SECONDS set, the collective that
         // waits for the exited rank expires (wait_or_abort) and aborts the job, which releases this fence too.
         // Without a timeout (P30) both sides wait forever.
-        std::atexit([] { MPI_Finalize(); });
+        std::atexit([] {
+            if (g_launched) {
+                end_own_process_group();  // P24: before the finalize fence, so nothing of this rank survives it
+            }
+            if (DistributedContext::is_terminating() && g_world_size > 1) {
+                // P28: the job is ending on a signal; a finalize fence would wait on peers that are still in their
+                // collectives. Abort instead: the launcher then ends every peer the same way, and each closes its own
+                // device on its way out. (A Python rank normally aborts before this point, from its own atexit.)
+                MPI_Abort(MPI_COMM_WORLD, 128 + SIGTERM);
+            }
+            MPI_Finalize();
+        });
 
         // Teardown plan P1: a C++ rank that leaves through an uncaught exception (a TT_FATAL becomes one) must not
         // let its peers hang in a barrier. Abort the job so prterun ends every rank with a code instead.
@@ -499,6 +569,9 @@ inline void init_env(int& argc, char**& argv) {
             MPI_Initialized(&inited);
             MPI_Finalized(&finalized);
             if (inited != 0 && finalized == 0 && g_world_size > 1) {
+                if (g_launched) {
+                    end_own_process_group();  // P24, the abort path
+                }
                 MPI_Abort(MPI_COMM_WORLD, 1);
             }
             remove_singleton_session_dir();  // P31: a world of one has nobody to abort for; leave nothing behind
@@ -932,6 +1005,9 @@ void MPIContext::translate_ranks_to_other_ctx(
 }
 
 void MPIContext::abort(int error_code) const {
+    if (g_launched) {
+        end_own_process_group();  // P24: the abort path ends this rank's helpers too
+    }
     if (size_ <= 1) {
         // Teardown plan P31: a singleton has no peers to end; an MPI_Abort here would only skip the atexit that removes
         // its private session directory. Exit normally with the code instead, so MPI_Finalize and the cleanup run.

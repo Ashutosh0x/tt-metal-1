@@ -194,58 +194,62 @@ maybe_fault("after_open")
 
 # ---- the collectives section ----
 _touch("coll_ready")  # past open; the parent can now signal while the ranks are entering the deadlocking collective
-if COLL == "barrier":
-    timed("coll_barrier", ttnn.distributed_context_barrier)
-elif COLL == "barrier_skip":
-    if is_victim():
-        mark("coll_skip: victim skips the barrier, sleeps 3 s")
-        time.sleep(3)
-    else:
+# The collectives run inside try/finally so the mesh is closed on every way out, a SIGTERM included: ttnn turns the
+# launcher's SIGTERM into SystemExit (P28), and the finally is what a real rank program's `with` block does.
+try:
+    if COLL == "barrier":
         timed("coll_barrier", ttnn.distributed_context_barrier)
-elif COLL == "send_no_recv":
-    if is_victim():
-        timed("coll_send_1MB_to_0", lambda: ttnn.distributed_context_send_bytes(b"x" * 1_000_000, 0, 7))
-    else:
+    elif COLL == "barrier_skip":
+        if is_victim():
+            mark("coll_skip: victim skips the barrier, sleeps 3 s")
+            time.sleep(3)
+        else:
+            timed("coll_barrier", ttnn.distributed_context_barrier)
+    elif COLL == "send_no_recv":
+        if is_victim():
+            timed("coll_send_1MB_to_0", lambda: ttnn.distributed_context_send_bytes(b"x" * 1_000_000, 0, 7))
+        else:
+            timed("coll_barrier", ttnn.distributed_context_barrier)
+    elif COLL == "recv_dead_peer":
+        if is_victim():
+            mark("victim acting: sigkill before the peer's recv")
+            os.kill(os.getpid(), signal.SIGKILL)
+        elif RANK == 0:
+            time.sleep(0.5)
+            timed(f"coll_recv_16B_from_{VICTIM}", lambda: ttnn.distributed_context_recv_bytes(16, VICTIM, 7))
+    elif COLL == "barrier_dead_peer":
+        if is_victim():
+            mark("victim acting: sigkill before the peers' barrier")
+            os.kill(os.getpid(), signal.SIGKILL)
+        else:
+            time.sleep(0.5)
+            timed("coll_barrier", ttnn.distributed_context_barrier)
+    elif COLL == "recv_bad_rank":
+        if RANK == 0:
+            timed("coll_recv_8B_from_rank5_nonexistent", lambda: ttnn.distributed_context_recv_bytes(8, 5, 7))
+    elif COLL == "allgather_skip":
+        if is_victim():
+            mark("coll_skip: victim skips the all_gather, sleeps 30 s")
+            time.sleep(30)
+        else:
+            timed("coll_allgather_int", lambda: ttnn.distributed_context_allgather_int(RANK))
+    elif COLL == "barrier_slow":
+        if is_victim():
+            slow = float(env("PROBE_SLOW_S", "4"))
+            mark(f"coll_slow: victim joins the barrier {slow} s late (a legitimately slow peer, not a hang)")
+            time.sleep(slow)
         timed("coll_barrier", ttnn.distributed_context_barrier)
-elif COLL == "recv_dead_peer":
-    if is_victim():
-        mark("victim acting: sigkill before the peer's recv")
-        os.kill(os.getpid(), signal.SIGKILL)
-    elif RANK == 0:
-        time.sleep(0.5)
-        timed(f"coll_recv_16B_from_{VICTIM}", lambda: ttnn.distributed_context_recv_bytes(16, VICTIM, 7))
-elif COLL == "barrier_dead_peer":
-    if is_victim():
-        mark("victim acting: sigkill before the peers' barrier")
-        os.kill(os.getpid(), signal.SIGKILL)
-    else:
-        time.sleep(0.5)
-        timed("coll_barrier", ttnn.distributed_context_barrier)
-elif COLL == "recv_bad_rank":
-    if RANK == 0:
-        timed("coll_recv_8B_from_rank5_nonexistent", lambda: ttnn.distributed_context_recv_bytes(8, 5, 7))
-elif COLL == "allgather_skip":
-    if is_victim():
-        mark("coll_skip: victim skips the all_gather, sleeps 30 s")
-        time.sleep(30)
-    else:
-        timed("coll_allgather_int", lambda: ttnn.distributed_context_allgather_int(RANK))
-elif COLL == "barrier_slow":
-    if is_victim():
-        slow = float(env("PROBE_SLOW_S", "4"))
-        mark(f"coll_slow: victim joins the barrier {slow} s late (a legitimately slow peer, not a hang)")
-        time.sleep(slow)
-    timed("coll_barrier", ttnn.distributed_context_barrier)
-elif COLL == "recv_no_send":
-    if RANK == 0:
-        timed(f"coll_recv_16B_from_{VICTIM}", lambda: ttnn.distributed_context_recv_bytes(16, VICTIM, 7))
-    elif is_victim():
-        mark("coll_recv_no_send: victim never sends, goes to close")
+    elif COLL == "recv_no_send":
+        if RANK == 0:
+            timed(f"coll_recv_16B_from_{VICTIM}", lambda: ttnn.distributed_context_recv_bytes(16, VICTIM, 7))
+        elif is_victim():
+            mark("coll_recv_no_send: victim never sends, goes to close")
 
-t = time.time()
-mark("close_enter")
-ttnn.close_mesh_device(mesh)
-mark(f"close_done dt={time.time() - t:.3f}")
+finally:
+    t = time.time()
+    mark("close_enter")
+    ttnn.close_mesh_device(mesh)
+    mark(f"close_done dt={time.time() - t:.3f}")
 if fabric_on:
     ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
 timed("barrier_close", ttnn.distributed_context_barrier)

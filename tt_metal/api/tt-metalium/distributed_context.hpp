@@ -157,6 +157,17 @@ public:
     static void create(int argc, char** argv);
     /// Returns the sub-context communicator (after an optional MPI_Comm_split via TT_RUN_SUBCONTEXT_ID).
     static const ContextPtr& get_current_world();
+
+    /// Teardown plan P28: a rank that is ending on a signal (the launcher's SIGTERM, a Ctrl-C) marks itself
+    /// terminating before it unwinds, so the close of its devices does not fence on peers that are still in their
+    /// own collectives; the device close itself still runs. Sticky for the life of the process.
+    static void mark_terminating();
+    static bool is_terminating();
+    /// Installs a SIGTERM handler that marks the process terminating and then chains to the handler that was there
+    /// (Python's, which raises SystemExit at the next bytecode; the default disposition is re-raised unchanged).
+    /// The context's collectives watch the flag and return at once, so a rank inside a collective comes back to its
+    /// caller on the signal itself, with no timeout involved. Installed once; a no-op under a simulator.
+    static void install_termination_handler();
     /// Returns the unsplit world communicator (MPI_COMM_WORLD). rank() and size() on this handle
     /// are global launcher ranks. Identical to get_current_world() when MPI is disabled or no split occurred.
     static ContextPtr get_world_context();

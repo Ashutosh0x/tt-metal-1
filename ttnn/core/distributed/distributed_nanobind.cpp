@@ -13,6 +13,9 @@
 #include <optional>
 #include <sstream>
 #include <vector>
+#include <cstdlib>
+#include <csignal>
+#include <unistd.h>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/make_iterator.h>
@@ -1137,6 +1140,9 @@ void py_module(nb::module_& mod) {
             return DistributedContext::is_initialized() && *DistributedContext::get_current_world()->size() > 1;
         };
         auto abort_code_for = [](nb::handle exc_type) {
+            if (DistributedContext::is_terminating()) {
+                return 128 + SIGTERM;  // P28: the collective that threw was abandoned on the signal
+            }
             return PyErr_GivenExceptionMatches(exc_type.ptr(), PyExc_KeyboardInterrupt) != 0 ? 130 : 1;
         };
         nb::module_ sys = nb::module_::import_("sys");
@@ -1171,12 +1177,42 @@ void py_module(nb::module_& mod) {
             recorded_exit_code = code;
             prev_exit(*args);  // raises SystemExit exactly as before
         });
+        // Only the process that installed the hooks may act on them: a forked child (os.fork, a multiprocessing
+        // worker) inherits them, and an MPI call from a child of a rank is undefined.
+        static const pid_t hook_owner = ::getpid();
         nb::module_ atexit_mod = nb::module_::import_("atexit");
         atexit_mod.attr("register")(nb::cpp_function([job_has_peers] {
-            if (recorded_exit_code != 0 && job_has_peers()) {
+            if (recorded_exit_code != 0 && ::getpid() == hook_owner && job_has_peers()) {
                 DistributedContext::get_current_world()->abort(recorded_exit_code);
             }
         }));
+
+        // Teardown plan P28: the launcher ends every survivor with SIGTERM when a job ends, and Python's default
+        // disposition kills the rank where it stands, with the mesh open (on hardware: firmware not at base, routers
+        // running). With a live context that has peers, SIGTERM becomes sys.exit(128 + SIGTERM) in the main thread, so
+        // the program's with/finally blocks close the mesh, the interpreter finalizes, and the atexit above aborts the
+        // job with 143. Installed only over the default disposition (a program's own handler wins) and never under a
+        // simulator (TT_METAL_SIMULATOR): there simulator_termination.cpp owns SIGTERM and exits through atexit, which
+        // releases the simulator session; a second handler would take that path away. A signal that lands while the
+        // rank is inside a C++ call is delivered when the call returns, as every Python handler is.
+        if (std::getenv("TT_METAL_SIMULATOR") == nullptr && job_has_peers()) {
+            nb::module_ signal_mod = nb::module_::import_("signal");
+            nb::object sigterm = signal_mod.attr("SIGTERM");
+            if (signal_mod.attr("getsignal")(sigterm).is(signal_mod.attr("SIG_DFL"))) {
+                nb::object sys_exit = sys.attr("exit");  // the recording wrapper above
+                signal_mod.attr("signal")(
+                    sigterm, nb::cpp_function([sys_exit](nb::object signum, nb::object /*frame*/) {
+                        if (::getpid() == hook_owner) {
+                            DistributedContext::mark_terminating();  // the close must not fence on the peers
+                            sys_exit(128 + nb::cast<int>(signum));
+                        }
+                    }));
+                // On top of Python's handler (which only runs between bytecodes): the C-level one marks the process
+                // terminating from the signal itself, so a collective in flight returns at once, then chains to
+                // Python's so SystemExit still follows.
+                DistributedContext::install_termination_handler();
+            }
+        }
     };
 
     // Initialize the distributed context

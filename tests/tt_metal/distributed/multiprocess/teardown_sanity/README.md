@@ -111,11 +111,21 @@ stage of a real distributed job, grouped by the piece that fails:
   sweeps the stale launcher directories of its own host at init, found through PMIx's `PMIX_SYSTEM_TMPDIR` and
   never this job's own `PMIX_SERVER_TMPDIR` (`test_context_sweeps_stale_launcher_dir`, launched with mpirun directly
   so tt-run's sweep cannot be the one that removes it);
-- **still open, as strict xfails** — the suite stays green and a row turns red the day its fix lands, so the fix
-  PR drops the marker: a helper that outlives a cleanly exiting rank (`test_helper_outlives_rank`, P24), SIGTERM
-  running the device teardown (`test_sigterm_runs_close`, P28), and a hang with no timeout set anywhere
-  (`test_hang_without_any_timeout`, P30, a default-policy decision). Each has a `TODO(teardown P..)` at the line
-  that should own it.
+- **the rank's helpers** (P24) — a helper the rank forked (a compile worker, a profiler capture) must not outlive it.
+  The launcher kills the rank's process group on an abort but only reaps the rank on a clean exit, so the rank's own
+  exit path, clean and abort alike, ends the process group it leads (SIGTERM, a 2 s grace, SIGKILL) before
+  `MPI_Finalize` or `MPI_Abort` (`test_helper_outlives_rank`: a helper that ignores SIGTERM is gone, the job is exit
+  0 and nothing needed tt-run's sweep). A rank that does not lead its own group (a plain pytest) does nothing;
+- **SIGTERM with the mesh open** (P28) — the launcher ends every survivor with SIGTERM at a job's end, and Python's
+  default disposition killed the rank where it stood. With a live context that has peers, ttnn turns SIGTERM into
+  `sys.exit(143)` in the main thread, so the program's `with`/`finally` blocks close the mesh (on hardware: firmware
+  back at base, routers stopped) and the P26 atexit aborts the job with 143 (`test_sigterm_runs_close`: rank 1 sees
+  `close_done`). Not installed under a simulator (`TT_METAL_SIMULATOR`), where `simulator_termination.cpp` owns
+  SIGTERM and exits through atexit to release the simulator session, nor over a handler the program installed
+  itself. A rank inside a C++ call gets the signal when the call returns; the launcher's own SIGKILL follow-up
+  (PRRTE's `odls_base_sigkill_timeout`) bounds how long the close may take;
+- **still open, as a strict xfail** — a hang with no timeout set anywhere (`test_hang_without_any_timeout`, P30, a
+  default-policy decision), with a `TODO(teardown P30)` at the line that should own it.
 
 ### Group G — raw-MPI expectation gates
 Two gates that confirm the OpenMPI build we ship provides what the DistributedContext teardown relies on — not

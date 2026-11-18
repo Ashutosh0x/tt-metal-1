@@ -1216,15 +1216,25 @@ bool MeshDeviceImpl::close_impl(MeshDevice* pimpl_wrapper) {
             // synchronize with and this rank must still close its own device, so we log and carry on instead of
             // letting the throw abandon the open device (which, when close runs from ~MeshDevice, would also
             // std::terminate out of a destructor).
-            try {
-                distributed_context_->barrier();
-            } catch (const std::exception& e) {
+            // Teardown plan P28: a rank ending on a signal (the launcher's SIGTERM) is leaving now; its peers may be
+            // in any collective, so fencing on them here would hang the close that the signal is meant to run.
+            if (multihost::DistributedContext::is_terminating()) {
                 log_warning(
                     tt::LogMetal,
-                    "Mesh device {}: the pre-close barrier failed ({}); a peer is gone, closing this rank's device "
-                    "without it.",
-                    this->id(),
-                    e.what());
+                    "Mesh device {}: this rank is terminating on a signal; closing its device without the pre-close "
+                    "barrier.",
+                    this->id());
+            } else {
+                try {
+                    distributed_context_->barrier();
+                } catch (const std::exception& e) {
+                    log_warning(
+                        tt::LogMetal,
+                        "Mesh device {}: the pre-close barrier failed ({}); a peer is gone, closing this rank's device "
+                        "without it.",
+                        this->id(),
+                        e.what());
+                }
             }
         }
 

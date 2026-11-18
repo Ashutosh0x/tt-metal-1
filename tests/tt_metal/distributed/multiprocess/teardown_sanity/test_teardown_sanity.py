@@ -102,12 +102,15 @@ def test_prte_timeout():
     ended(r)
     assert r.exit == 241, str(r)
     # Require positive evidence that the wall clock ended the intended deadlock, not a slow start-up: both ranks
-    # must have reached the collective section (a ``coll_*`` marker), past open — not merely "not a startup marker",
-    # which would also accept ``open_enter`` (entered open, never completed).
+    # must have entered the collective section (a ``coll_*`` marker in their output), past open — not merely "not a
+    # startup marker", which would also accept ``open_enter`` (entered open, never completed). The last marker is no
+    # longer the collective itself: PRRTE's timeout ends the ranks with SIGTERM, which since P28 makes the collective
+    # return and the rank close its device (``close_done``) on the way out.
     for rank in (0, 1):
-        assert r.reached.get(rank, "").startswith(
-            "coll"
+        assert f"[probe r={rank} " in r.log and any(
+            f"[probe r={rank} " in line and "] coll_" in line for line in r.log.splitlines()
         ), f"rank {rank} had not reached the collective when the wall clock fired: {r}"
+        assert "close_done" in r.reached.get(rank, ""), f"rank {rank} did not close its device on PRRTE's SIGTERM: {r}"
     clean(r)
 
 
@@ -485,16 +488,12 @@ def test_sigint_one_rank():
     clean(r)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="P24: a rank's helper outlives it; fix: the rank's exit path ends its own process group (clean exit and abort alike)",
-)
 def test_helper_outlives_rank():
-    """Rank 1 forks a helper that ignores SIGTERM, then finishes its work and exits cleanly. On an abort prterun kills
-    the rank's whole process group, helper included; on a clean exit it only reaps the rank, so the helper lives on.
-    Today only tt-run's session sweep ends it, on the launch host, after the launcher returned, and turns the clean
-    job into exit 1; a direct mpirun or a remote host keeps it. The row asserts the helper is gone and the job is
-    clean without tt-run having to sweep."""
+    """Rank 1 forks a helper that ignores SIGTERM, then finishes its work and exits cleanly. The launcher kills a rank's
+    whole process group on an abort but only reaps the rank on a clean exit, so the helper used to live on until
+    tt-run's session sweep found it (launch host only) and turned the clean job into exit 1. P24: the rank's own exit
+    path ends the process group it leads (SIGTERM, a grace, SIGKILL) before MPI_Finalize, so the job is clean and exit 0
+    without the launcher or tt-run having to sweep."""
     r = run_case("helper_outlives_rank", {"PROBE_SCENARIO": "fork_helper", "PROBE_PHASE": "after_open"}, DEADLINE_END)
     ended(r)
     clean(r)
@@ -587,14 +586,12 @@ def test_early_exit0_hangs_peer():
     clean(r)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="P28: SIGTERM from the launcher runs no device teardown; fix: a SIGTERM handler that runs the MetalContext teardown before the rank dies (the simulator's path, generalised)",
-)
 def test_sigterm_runs_close():
     """SIGTERM reaches rank 1 with its mesh open (what the launcher sends every survivor when a job ends). The rank
-    must close its device on the way out: on the mock that is the close_done marker; on hardware it is firmware
-    back at base and the routers stopped (R5). Today the default disposition kills it where it stands."""
+    must close its device on the way out: on the mock that is the close_done marker; on hardware it is firmware back
+    at base and the routers stopped (R5). P28: with a live context and peers, ttnn turns SIGTERM into SystemExit(143),
+    so the program's finally/with blocks close the mesh, and the P26 atexit then aborts the job with 143. The default
+    disposition used to kill the rank where it stood."""
     r = run_case(
         "sigterm_with_mesh_open",
         {"PROBE_COLL": "barrier_slow", "PROBE_SLOW_S": "8"},
