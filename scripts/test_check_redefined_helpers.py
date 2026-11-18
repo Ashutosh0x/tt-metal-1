@@ -88,7 +88,7 @@ def test_literal_tile_constant_on_the_host():
         "constexpr uint32_t TILE_WIDTH = 32;\nconstexpr uint32_t TILE_HEIGHT = 32;\n",
     )
     assert [item[2] for item in found] == ["TILE_WIDTH", "TILE_HEIGHT"]
-    assert "tt-metalium/constants.hpp" in found[0][3]
+    assert "tt-metalium/data_formats/tile_constants.hpp" in found[0][3]
 
 
 def test_l1_budget_formula_is_flagged_and_the_canonical_call_is_not():
@@ -150,8 +150,8 @@ def test_only_added_lines_are_reported():
 
 def test_canonical_headers_are_clean():
     for rel in (
-        "tt_metal/api/tt-metalium/math.hpp",
-        "tt_metal/api/tt-metalium/constants.hpp",
+        "tt_metal/api/tt-metalium/utils/math.hpp",
+        "tt_metal/api/tt-metalium/data_formats/tile_constants.hpp",
         "tt_metal/hw/inc/api/tile_constants.h",
         "tt_metal/hw/inc/api/alignment.h",
         "ttnn/cpp/ttnn/operations/core/program_cache_l1.hpp",
@@ -379,6 +379,6 @@ def test_diff_parser_counts_only_additions(monkeypatch):
 def test_list_mentions_both_sides(capsys):
     assert chk.main(["--list"]) == 0
     out = capsys.readouterr().out
-    assert "tt-metalium/math.hpp" in out
+    assert "tt-metalium/utils/math.hpp" in out
     assert "api/tile_constants.h" in out
     assert "get_max_l1_space" in out
