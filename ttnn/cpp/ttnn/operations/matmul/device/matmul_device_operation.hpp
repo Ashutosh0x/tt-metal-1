@@ -28,6 +28,7 @@ struct MatmulDeviceOperation {
         MatmulMeshWorkloadMultiCoreReuseMcast1DProgramFactory,  // gather_in0 legacy path
         MatmulMultiCoreReuseMcast2DProgramFactory,
         MatmulMultiCoreReuseMultiCastDRAMShardedProgramFactory,
+        MatmulMultiCoreReuseMultiCastDRAMShardedPerDeviceProgramFactory,
         MatmulMultiCoreReuseBatchedHSDRAMShardedProgramFactory>;
 
     static program_factory_t select_program_factory(

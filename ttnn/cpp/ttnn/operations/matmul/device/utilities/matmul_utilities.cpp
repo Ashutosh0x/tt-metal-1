@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <unordered_map>
+#include <mutex>
 #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
 
 #include <algorithm>
@@ -399,14 +401,75 @@ void get_optimal_dram_bank_to_reader_assignment(
     all_worker_cores = tt::tt_metal::CoreRangeSet(all_cores_set);
 }
 
+std::vector<tt::tt_metal::CoreCoord> get_optimal_dram_bank_workers(
+    const tt::tt_metal::distributed::MeshDevice& device,
+    tt::tt_metal::NOC noc,
+    const std::optional<ttnn::MeshCoordinate>& coord) {
+    if (!coord.has_value()) {
+        return device.get_optimal_dram_bank_to_logical_worker_assignment(noc);
+    }
+    const auto per_bank = device.get_optimal_dram_bank_to_logical_worker_assignment(noc, *coord);
+    std::vector<tt::tt_metal::CoreCoord> workers(per_bank.size());
+    for (const auto& [bank_id, core] : per_bank) {
+        TT_FATAL(bank_id < workers.size(), "DRAM bank id {} out of range ({} banks)", bank_id, workers.size());
+        workers[bank_id] = core;
+    }
+    return workers;
+}
+
+bool mesh_has_uniform_dram_bank_workers(const tt::tt_metal::distributed::MeshDevice& device) {
+    static std::mutex cache_mutex;
+    static std::unordered_map<int, bool> uniform_by_mesh_id;
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    if (const auto it = uniform_by_mesh_id.find(device.id()); it != uniform_by_mesh_id.end()) {
+        return it->second;
+    }
+    bool uniform = true;
+    for (const auto noc : {tt::tt_metal::NOC::NOC_0, tt::tt_metal::NOC::NOC_1}) {
+        std::optional<std::vector<tt::tt_metal::CoreCoord>> reference;
+        for (const auto& coord : ttnn::MeshCoordinateRange(device.shape())) {
+            if (!device.is_local(coord)) {
+                continue;
+            }
+            auto workers = get_optimal_dram_bank_workers(device, noc, coord);
+            if (!reference.has_value()) {
+                reference = std::move(workers);
+            } else if (workers != *reference) {
+                uniform = false;
+                break;
+            }
+        }
+        if (!uniform) {
+            break;
+        }
+    }
+    if (!uniform) {
+        // Once per mesh: each device's NOC_0 reader core per DRAM bank, so a log shows which devices disagree.
+        for (const auto& coord : ttnn::MeshCoordinateRange(device.shape())) {
+            if (device.is_local(coord)) {
+                log_info(
+                    tt::LogOp,
+                    "Mesh {} device {}: DRAM-bank reader cores (NOC_0) {}; the DRAM-sharded matmul builds per-device "
+                    "programs on this mesh",
+                    device.id(),
+                    coord,
+                    get_optimal_dram_bank_workers(device, tt::tt_metal::NOC::NOC_0, coord));
+            }
+        }
+    }
+    uniform_by_mesh_id.emplace(device.id(), uniform);
+    return uniform;
+}
+
 std::vector<DramBankReaderAssignment> get_dram_bank_reader_assignments(
     tt::tt_metal::distributed::MeshDevice& device,
     tt::tt_metal::NOC noc,
     uint32_t workers_per_bank,
-    const tt::tt_metal::CoreRangeSet& secondary_reader_excluded_cores) {
+    const tt::tt_metal::CoreRangeSet& secondary_reader_excluded_cores,
+    const std::optional<ttnn::MeshCoordinate>& coord) {
     validate_num_workers_per_dram_bank(workers_per_bank);
 
-    const auto primary_workers = device.get_optimal_dram_bank_to_logical_worker_assignment(noc);
+    const auto primary_workers = get_optimal_dram_bank_workers(device, noc, coord);
     std::vector<DramBankReaderAssignment> assignments;
     assignments.reserve(primary_workers.size() * workers_per_bank);
 

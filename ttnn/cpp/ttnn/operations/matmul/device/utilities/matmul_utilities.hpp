@@ -429,10 +429,23 @@ void get_optimal_dram_bank_to_reader_assignment(
     tt::tt_metal::CoreRangeSet& all_worker_cores,
     tt::tt_metal::NOC noc);
 
+// Optimal DRAM-bank -> logical worker core list (indexed by bank id) for the device at `coord` of the mesh. Without a
+// coordinate it is the mesh-level query (the reference device's assignment), exact only on a homogeneously harvested
+// mesh.
+std::vector<tt::tt_metal::CoreCoord> get_optimal_dram_bank_workers(
+    const tt::tt_metal::distributed::MeshDevice& device,
+    tt::tt_metal::NOC noc,
+    const std::optional<ttnn::MeshCoordinate>& coord = std::nullopt);
+
+// True when every local device of the mesh has the same optimal DRAM-bank workers on NOC_0 and NOC_1 (one program
+// with the reference device's reader cores is then right for every device). Computed once per mesh device.
+bool mesh_has_uniform_dram_bank_workers(const tt::tt_metal::distributed::MeshDevice& device);
+
 std::vector<DramBankReaderAssignment> get_dram_bank_reader_assignments(
     tt::tt_metal::distributed::MeshDevice& device,
     tt::tt_metal::NOC noc,
     uint32_t workers_per_bank,
-    const tt::tt_metal::CoreRangeSet& secondary_reader_excluded_cores);
+    const tt::tt_metal::CoreRangeSet& secondary_reader_excluded_cores,
+    const std::optional<ttnn::MeshCoordinate>& coord = std::nullopt);
 
 }  // namespace ttnn::prim::dram_sharded_helpers

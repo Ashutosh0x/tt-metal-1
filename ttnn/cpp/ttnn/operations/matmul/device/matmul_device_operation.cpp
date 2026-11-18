@@ -2735,11 +2735,11 @@ bool get_broadcast_batch(
 }  // namespace
 
 MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_factory(
-    const operation_attributes_t& operation_attributes, const tensor_args_t& /*tensor_args*/) {
+    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     const auto& config = operation_attributes.program_config.value();
 
     return std::visit(
-        [&operation_attributes](const auto& c) -> program_factory_t {
+        [&operation_attributes, &tensor_args](const auto& c) -> program_factory_t {
             using T = std::decay_t<decltype(c)>;
             if constexpr (std::is_same_v<T, operations::matmul::MatmulMultiCoreProgramConfig>) {
                 return MatmulMultiCoreProgramFactory{};
@@ -2763,6 +2763,11 @@ MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_f
             } else if constexpr (std::is_same_v<
                                      T,
                                      operations::matmul::MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig>) {
+                // Per-device reader cores only where the mesh's devices disagree on them (heterogeneous harvesting).
+                const auto* mesh_device = tensor_args.input_tensors.at(0).device();
+                if (mesh_device != nullptr && !dram_sharded_helpers::mesh_has_uniform_dram_bank_workers(*mesh_device)) {
+                    return MatmulMultiCoreReuseMultiCastDRAMShardedPerDeviceProgramFactory{};
+                }
                 return MatmulMultiCoreReuseMultiCastDRAMShardedProgramFactory{};
             } else if constexpr (
                 std::is_same_v<T, operations::matmul::MatmulMultiCoreReuseMultiCastBatchedDRAMShardedProgramConfig>) {
