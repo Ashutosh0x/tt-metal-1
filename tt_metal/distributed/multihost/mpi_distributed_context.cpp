@@ -278,8 +278,37 @@ static void end_own_process_group() {
             break;
         }
     }
-    for (const pid_t pid : own_leftover_processes()) {
+    const auto to_kill = own_leftover_processes();
+    for (const pid_t pid : to_kill) {
         ::kill(pid, SIGKILL);
+    }
+    // SIGKILL is asynchronous: leave only once every target is gone from /proc, or is a zombie that is not ours to reap
+    // (its own parent will). Without this wait the rank exits while the helper is still being torn down and the
+    // launcher's census still sees it (seen in CI). Our own children are reaped on the way.
+    const pid_t self = ::getpid();
+    for (int i = 0; i < 250; ++i) {  // up to 5 s, normally one or two iterations
+        bool pending = false;
+        for (const pid_t pid : to_kill) {
+            ::waitpid(pid, nullptr, WNOHANG);  // reaps a child of ours that has exited; ECHILD for a grandchild
+            std::ifstream stat("/proc/" + std::to_string(pid) + "/stat");
+            std::string line;
+            if (!std::getline(stat, line)) {
+                continue;  // gone
+            }
+            const auto close_paren = line.rfind(')');
+            std::istringstream rest(close_paren == std::string::npos ? "" : line.substr(close_paren + 1));
+            char state = 0;
+            long ppid = 0;
+            rest >> state >> ppid;
+            if (state == 'Z' && static_cast<pid_t>(ppid) != self) {
+                continue;  // exited; its parent reaps it
+            }
+            pending = true;
+        }
+        if (!pending) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     while (::waitpid(-1, nullptr, WNOHANG) > 0) {  // reap what was ours, so the launcher counts nothing left
     }
