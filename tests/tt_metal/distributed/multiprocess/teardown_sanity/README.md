@@ -115,7 +115,8 @@ stage of a real distributed job, grouped by the piece that fails:
   The launcher kills the rank's process group on an abort but only reaps the rank on a clean exit, so the rank's own
   exit path, clean and abort alike, ends the process group it leads (SIGTERM, a 2 s grace, SIGKILL) before
   `MPI_Finalize` or `MPI_Abort` (`test_helper_outlives_rank`: a helper that ignores SIGTERM is gone, the job is exit
-  0 and nothing needed tt-run's sweep). A rank that does not lead its own group (a plain pytest) does nothing;
+  0 and nothing needed tt-run's sweep; `test_helper_ended_by_rank_without_ttrun`: the same with `mpirun` directly, no
+  tt-run backstop in the picture, checking the helper's pid and the context's own report). Only a launched rank runs it;
 - **SIGTERM with the mesh open** (P28) — the launcher ends every survivor with SIGTERM at a job's end, and Python's
   default disposition killed the rank where it stood. With a live context that has peers, ttnn turns SIGTERM into
   `sys.exit(143)` in the main thread, so the program's `with`/`finally` blocks close the mesh (on hardware: firmware

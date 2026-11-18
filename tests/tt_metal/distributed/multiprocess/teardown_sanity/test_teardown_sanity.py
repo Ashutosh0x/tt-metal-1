@@ -24,6 +24,7 @@ tests/scripts/multihost/run_fabric_cpu_only_unit_tests.sh).
 from __future__ import annotations
 
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -501,6 +502,51 @@ def test_helper_outlives_rank():
         "the helper was ended by tt-run's sweep, not by the rank's own exit path\n" + r.log[-2000:]
     )
     assert r.exit == 0, str(r)
+
+
+def test_helper_ended_by_rank_without_ttrun(tmp_path):
+    """P24 at the MPI-context level alone: launched with mpirun directly, so neither tt-run's session sweep nor
+    its exit-code handling is in the picture. A one-rank job inits the context, forks a helper that ignores SIGTERM,
+    prints the helper's pid and exits cleanly. The MPIContext's exit path must have ended the helper by the time the
+    launcher returns; the row checks the pid itself, not a log line."""
+    import subprocess
+
+    code = (
+        "import ttnn, subprocess, signal, sys; ttnn.init_distributed_context(); "
+        "h = subprocess.Popen([sys.executable, '-c', "
+        "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)'], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        "print('HELPER_PID', h.pid, flush=True)"
+    )
+    cmd = [
+        mpirun_path(),
+        "--mca",
+        "btl",
+        "self,tcp",
+        "--allow-run-as-root",
+        "--oversubscribe",
+        "-np",
+        "1",
+        PYTHON,
+        "-c",
+        code,
+    ]
+    r = run_case("helper_without_ttrun", {"TT_METAL_MOCK_CLUSTER_DESC_PATH": str(CONFLICT_DESC)}, DEADLINE_END, cmd=cmd)
+    ended(r)
+    assert r.exit == 0, str(r)
+    m = re.search(r"HELPER_PID (\d+)", r.log)
+    assert m, "the rank did not report its helper's pid\n" + r.log[-2000:]
+    helper = int(m.group(1))
+    alive = os.path.exists(f"/proc/{helper}")
+    if alive:
+        os.kill(helper, signal.SIGKILL)  # do not leave it for the next row
+    assert not alive, (
+        f"the helper (pid {helper}) outlived the rank: the MPIContext exit path did not end it\n" + r.log[-2000:]
+    )
+    assert "ending 1 process(es) this rank left behind" in r.log, (
+        "the context did not report ending the helper\n" + r.log[-2000:]
+    )
+    clean(r)
 
 
 def test_launcher_killed_no_session_dir():
