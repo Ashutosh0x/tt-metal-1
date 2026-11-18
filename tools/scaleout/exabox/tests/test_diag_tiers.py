@@ -59,6 +59,9 @@ class TestShellWrappersAgree(unittest.TestCase):
         text = (SUITE_DIR / "run_diag_docker.sh").read_text()
         self.assertIn("[[ ${TIER} != flash && ${TIER} != light ]]", text)
 
+    def test_only_flash_prints_the_eth_summary(self):
+        self.assertEqual({name for name, tier in TIERS.items() if tier.eth_summary}, {"flash"})
+
     def test_run_health_check_accepts_every_tier(self):
         text = (SUITE_DIR / "test_infrastructure" / "run_health_check.py").read_text()
         m = re.search(r'"--tier",.*?choices=\[([^\]]*)\]', text, re.DOTALL)
