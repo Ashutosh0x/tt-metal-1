@@ -131,8 +131,8 @@ stage of a real distributed job, grouped by the piece that fails:
 ### Group G — raw-MPI expectation gates
 Two gates that confirm the OpenMPI build we ship provides what the DistributedContext teardown relies on — not
 tests of things MPI cannot do: `test_mpi_delivers_proc_failed_ulfm` (under ULFM a dead rank is delivered to the
-survivors as a process failure) and `test_mpi_abort_reports_failure` (a survivor's `MPI_Abort` makes the launcher
-return a non-zero code).
+survivors as a process failure). A survivor's `MPI_Abort` ending the job is #65121's `test_ttrun_dead_peer_survivors_abort`;
+under `--with-ft ulfm` it meets openpmix/prrte#2815 (PRRTE 3.0.8), a fingerprinted expected failure there.
 
 ### Group H — multi-host DistributedContext (runs on SC4, needs ≥ 2 hosts)
 The cross-host counterpart of Group D: Group D proves the *launcher* reaps a fault on a remote host; this proves

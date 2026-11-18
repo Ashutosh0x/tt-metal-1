@@ -329,32 +329,3 @@ def test_mpi_delivers_proc_failed_ulfm():
     r = run_case("mpi_delivers_proc_failed", {**NP, "PROBE_SCENARIO": "victim_sigkill"}, DEADLINE_END, cmd=mpi_cmd())
     ended(r)
     clean(r)
-
-
-def test_mpi_abort_reports_failure():
-    """MPI_Abort from a survivor after a peer death must make the launcher report a non-zero code even under ULFM.
-    This is the teardown shape the DistributedContext uses; the row confirms the MPI build honours it. The direct
-    ``mpirun --with-ft ulfm`` launch here (no tt-run, so none of its fail-safes) is where the launcher's own race
-    shows: openpmix/prrte#2815, intermittent in CI (two shapes: prterun left up with the ranks gone, or exit 0 as
-    #60468's ULFM table records). Only those two fingerprints are tolerated, as a non-strict xfail that names the
-    fixing versions; anything else is a real failure. The DistributedContext's default path never takes this route
-    (tt-run launches the plain mpirun), and ``test_ttrun_abort_ends`` proves the abort reports on that path."""
-    r = run_case(
-        "mpi_abort_reports",
-        {**NP, "PROBE_SCENARIO": "victim_sigkill", "PROBE_SURVIVOR_ACTION": "abort"},
-        DEADLINE_END,
-        cmd=mpi_cmd(),
-    )
-    try:
-        ended(r)
-        nonzero(r)
-        clean(r)
-    except AssertionError:
-        if "survivor MPI_Abort" in r.log and (r.timed_out or r.exit == 0):
-            pytest.xfail(
-                "openpmix/prrte#2815 under --with-ft ulfm: the survivors' MPI_Abort right after a peer's death is "
-                f"lost ({'prterun left up' if r.timed_out else 'the launcher returned 0'}). PRRTE 3.0.8 / Open MPI "
-                "5.0.7rc2; fixed in open-mpi/ompi#14590 (main) / #14713 (v6.0.x), not in the 5.0.x series. "
-                "https://github.com/openpmix/prrte/issues/2815"
-            )
-        raise
