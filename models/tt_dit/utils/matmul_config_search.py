@@ -728,7 +728,7 @@ def run_jobs(spec_path: Path, spec: Spec, db: Path, wanted: list[Key], devices: 
                     json.dump([j.to_json() for j in share], f)
                 job_files[d] = f.name
             _run_workers(
-                {d: [str(spec_path), job_files[d], str(db), str(inflights[d])] for d in shares},
+                {d: [str(spec_path), job_files[d], str(db), str(inflights[d]), str(d)] for d in shares},
                 {d: inflights[d] for d in shares},
                 spec.arch,
             )
@@ -772,14 +772,19 @@ def run_jobs(spec_path: Path, spec: Spec, db: Path, wanted: list[Key], devices: 
 def _run_workers(args: dict[int, list[str]], inflights: dict[int, Path], arch: str) -> None:
     """Run one worker per device at once.
 
-    Each worker sees only its own chip (`TT_VISIBLE_DEVICES`), since a process opening one chip of
-    several starts and locks all it sees. A worker writes its in-flight file before each batch and
-    removes it after, so a worker whose file has not changed for WATCHDOG_SECONDS hangs and is
-    stopped. A single Blackhole chip of a multi-chip card is a custom cluster to tt-metal, which
-    then wants a mesh graph descriptor, the one of a single chip.
+    With several devices, each worker sees only its own chip (`TT_VISIBLE_DEVICES`), since a
+    process opening one chip of several starts and locks all it sees. A single Blackhole chip of a
+    multi-chip card is then a custom cluster to tt-metal, which wants a mesh graph descriptor, the
+    one of a single chip. A lone worker sees every chip and opens its own among them, which works
+    where a chip cannot be opened on its own, as on a Wormhole Galaxy, whose chips run routing
+    firmware on their Ethernet cores.
+
+    A worker writes its in-flight file before each batch and removes it after, so a worker whose
+    file has not changed for WATCHDOG_SECONDS hangs and is stopped.
     """
     env = {"TT_METAL_OPERATION_TIMEOUT_SECONDS": "120", **os.environ, **WORKER_ENV}
-    if arch == "blackhole":
+    alone = len(args) == 1
+    if arch == "blackhole" and not alone:
         env.setdefault("TT_MESH_GRAPH_DESC_PATH", str(SINGLE_BLACKHOLE_MESH_GRAPH))
 
     def state(path: Path) -> int | None:
@@ -794,7 +799,7 @@ def _run_workers(args: dict[int, list[str]], inflights: dict[int, Path], arch: s
             # Its own session, so a Ctrl-C reaches only the driver, which then stops the worker in order.
             procs[d] = subprocess.Popen(
                 [sys.executable, "-m", MODULE, "_worker", *a],
-                env={**env, "TT_VISIBLE_DEVICES": str(d)},
+                env=env if alone else {**env, "TT_VISIBLE_DEVICES": str(d)},
                 start_new_session=True,
             )
         last = {d: (state(inflights[d]), time.monotonic()) for d in procs}
@@ -831,14 +836,16 @@ def _stop(*procs: subprocess.Popen) -> None:
             p.wait()
 
 
-def _worker(spec_path: Path, jobs_path: Path, db: Path, inflight: Path) -> None:
+def _worker(spec_path: Path, jobs_path: Path, db: Path, inflight: Path, device_id: int) -> None:
     import torch
 
     import ttnn
 
     spec = Spec.load(spec_path)
     jobs = [Job.from_json(j) for j in json.loads(jobs_path.read_text())]
-    device = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 1), trace_region_size=8 << 20)
+    # The driver hides the other chips from a worker, unless it runs alone (see _run_workers).
+    ids = [] if "TT_VISIBLE_DEVICES" in os.environ else [device_id]
+    device = ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(1, 1), physical_device_ids=ids, trace_region_size=8 << 20)
     try:
         arch = device.arch().name.lower()
         if arch != spec.arch:
@@ -1346,7 +1353,8 @@ def main(argv: list[str] | None = None) -> None:
     # SIGTERM unwinds like Ctrl-C: the driver stops its worker, the worker closes the device.
     signal.signal(signal.SIGTERM, lambda signum, _frame: sys.exit(128 + signum))
     if args[:1] == ["_worker"]:
-        _worker(*(Path(a) for a in args[1:5]))
+        spec, jobs, db, inflight, device_id = args[1:6]
+        _worker(Path(spec), Path(jobs), Path(db), Path(inflight), int(device_id))
         return
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("spec", type=Path)
